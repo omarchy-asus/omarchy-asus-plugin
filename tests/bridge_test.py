@@ -385,15 +385,17 @@ class BridgeTest(unittest.TestCase):
         for bad in (("kbd-color", "red"), ("slash-flag", "Bogus", "true"), ("battery-limit", "5"), ("nope",)):
             self.assertFalse(h.send(*bad)["ok"], bad)
 
-    def test_no_settings_file_enforces_nothing(self):
+    def test_no_settings_file_only_turns_the_keyboard_off_on_battery(self):
         h = self.harness(conf=None)
         h.wait(lambda: h.state.get("hasAura") and h.state.get("refreshHz") == 60, what="started")
+        self.assertEqual([c for c in h.calls() if "set" in c], [], "nothing set on AC")
         h.fake({"set": ["/org/freedesktop/UPower", "org.freedesktop.UPower", "OnBattery", "b", True]})
         h.wait(lambda: h.state.get("onBattery"), what="battery")
+        h.wait(lambda: h.state.get("kbdBrightness") == 0, what="keyboard off")
         h.send("get")
         self.assertEqual(h.hypr.evals, [])
-        self.assertEqual([c for c in h.calls() if "set" in c], [])
-        self.assertEqual((h.state["kbdAC"], h.state["kbdBattery"]), ("", ""))
+        self.assertEqual([c["set"][2] for c in h.calls() if "set" in c], ["Brightness"])
+        self.assertEqual((h.state["kbdAC"], h.state["kbdBattery"]), ("", "off"))
 
     def test_fn_keys_reach_the_state(self):
         h = self.harness()

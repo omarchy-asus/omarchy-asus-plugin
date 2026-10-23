@@ -15,7 +15,8 @@ import qs.Ui
 //
 //   Keyboard backlight -- a real kernel LED (/sys/class/leds/asus::kbd_backlight)
 //     owned by asusd's xyz.ljones.Aura interface. Brightness is set per power
-//     source (KBD_AC/KBD_BATTERY in omarchy-asus.conf): the bridge re-applies
+//     source (KBD_AC/KBD_BATTERY in omarchy-asus.conf; battery defaults to off,
+//     about 2 W saved): the bridge re-applies
 //     the level for the current source on every plug and unplug, which is why
 //     it is presented as two levels rather than one slider. Colour and
 //     power-state flags go straight to asusd.
@@ -404,7 +405,9 @@ Panel {
               Text {
                 textFormat: Text.PlainText
                 width: parent.width
-                text: "Applied again on every plug and unplug, so they are set here "
+                text: "The lights draw about 2 W at high, a big share of the laptop's "
+                    + "idle draw, so on battery they stay off unless you pick a level. "
+                    + "Applied again on every plug and unplug, so they are set here "
                     + "rather than as one live slider."
                 color: Qt.darker(root.bar.foreground, 1.5)
                 font.family: root.bar.fontFamily

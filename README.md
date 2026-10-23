@@ -63,7 +63,7 @@ a script):
 
 | key | values | what |
 |---|---|---|
-| `KBD_AC`, `KBD_BATTERY` | `off` `low` `med` `high` | keyboard backlight; the panel's "On AC" / "On battery" rows write these |
+| `KBD_AC`, `KBD_BATTERY` | `off` `low` `med` `high` | keyboard backlight; the panel's "On AC" / "On battery" rows write these. Unset, `KBD_BATTERY` is `off`: the lights draw about 2 W at high, a big share of the idle draw on battery |
 | `HZ_AC`, `HZ_BATTERY`, `HZ_GAMING` | Hz | the internal panel's refresh rate |
 | `PANEL_OVERDRIVE_AC`, `PANEL_OVERDRIVE_BATTERY` | `0` `1` | asus-armoury panel overdrive, through asusd |
 | `INTERNAL_OUTPUT` | `eDP-1`, or `desc:<EDID description>` | which output is the panel (default: the first `eDP`) |
@@ -91,7 +91,8 @@ follow that curve while limits apply. The values the G16 used with rog-power:
 `PPT_USBC="25 30 40"`, `PPT_WEAK_BARREL="45 55 65"`, `BOOST_WEAK_BARREL=5`
 (the OEM barrel left at stock).
 
-A key that isn't set is left alone, so with no file nothing is enforced. The
+A key that isn't set is left alone, so with no file nothing is enforced except
+the keyboard lights going off on battery (`KBD_BATTERY`). The
 refresh pin (the panel's 60/240/Auto switch, stored in
 `~/.local/state/omarchy/omarchy-asus-hz`) wins over gaming mode
 (`omarchy-asus-gaming`), which wins over the power source. For a key binding:
