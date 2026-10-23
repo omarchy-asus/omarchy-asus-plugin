@@ -113,6 +113,9 @@ Item {
   function startBridge() {
     if (bridge.running) return
     svc._buf = ""
+    // A new bridge counts acks from 0 again: waiting for one past our last
+    // command would drop every state it sends until the next click.
+    svc._lastSent = 0
     bridge.environment = svc.launchEnvironment()
     bridge.running = true
   }

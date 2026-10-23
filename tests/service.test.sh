@@ -6,7 +6,8 @@
 #   - a click updates the property at once, and a state from before that
 #     click (ack lower than the command id) is ignored;
 #   - commands reach the bridge with their arguments;
-#   - a bridge that exits is started again.
+#   - a bridge that exits is started again, and its states (acks from 0)
+#     are applied.
 # Run: tests/service.test.sh   (skips without quickshell's `qs`)
 set -u
 command -v qs >/dev/null || { echo "service tests skipped: no qs"; exit 0; }
@@ -21,9 +22,12 @@ starts = os.path.join(os.path.dirname(os.environ["STUB_LOG"]), "starts")
 with open(starts, "a") as f:
     f.write("x")
 n = len(open(starts).read())
+# Like the bridge, every state carries the current colour: a restarted
+# bridge reports its own (and counts acks from 0 again).
+color = "ABCDEF" if n > 1 else "00FF88"
 def state(ack, **kw):
     s = {"type": "state", "ack": ack, "onBattery": False, "hasAura": True, "kbdBrightness": 1,
-         "kbdColor": "00FF88", "kbdAC": "med", "kbdBattery": "off", "kbdBoot": True,
+         "kbdColor": color, "kbdAC": "med", "kbdBattery": "off", "kbdBoot": True,
          "kbdAwake": True, "kbdSleep": False, "kbdShutdown": True, "hasSlash": True,
          "slashOn": True, "slashBrightness": 100, "slashPattern": 2, "chargeLimit": 80,
          "refreshHz": 240, "refreshOverride": "auto", "gaming": False, "hasWinlock": True,
@@ -35,8 +39,9 @@ for line in sys.stdin:
     msg = json.loads(line)
     log.write(json.dumps([msg["cmd"]] + msg["args"]) + "\n"); log.flush()
     if msg["cmd"] == "kbd-color":
-        state(msg["id"] - 1, kbdColor="00FF88")     # stale: from before the click
-        state(msg["id"], kbdColor=msg["args"][0])
+        state(msg["id"] - 1)     # stale: from before the click
+        color = msg["args"][0]
+        state(msg["id"])
     elif msg["cmd"] == "crash":
         sys.exit(3)
     else:
@@ -74,6 +79,7 @@ ShellRoot {
   } }
   Timer { interval: 5500; running: true; onTriggered: {
     ok("bridge started again after it exited", r.s.ready)
+    ok("the new bridge's state is applied", r.s.kbdColor === "ABCDEF")
     for (var i = 0; i < r.out.length; i++) console.log(r.out[i])
     Qt.exit(0)
   } }
@@ -81,10 +87,10 @@ ShellRoot {
 EOF
 
 out=$(cd "$T" && QT_QPA_PLATFORM=offscreen timeout 30 qs -p "$T/shell.qml" 2>&1 |
-  grep -E 'ok - |LOAD ERROR' | sed 's/^.*\(not ok\|ok\) - /\1 - /')
+  grep -oE '(not ok|ok) - .*|LOAD ERROR.*')
 echo "$out"
 fail=0
-[[ $(grep -c '^ok - ' <<<"$out") -eq 7 ]] && ! grep -q '^not ok\|LOAD' <<<"$out" || fail=1
+[[ $(grep -c '^ok - ' <<<"$out") -eq 8 ]] && ! grep -q '^not ok\|LOAD' <<<"$out" || fail=1
 expect='["kbd-color", "1A2B3C"]
 ["kbd-level", "ac", "high"]
 ["kbd-power", "sleep", "true"]

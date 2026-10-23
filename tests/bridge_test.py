@@ -724,6 +724,14 @@ class BridgeTest(unittest.TestCase):
         state = lambda n: open(os.path.join(h.state_dir, n)).read().strip()
         self.assertEqual((state("omarchy-asus-ppt-curves"), state("omarchy-asus-ppt-groups")), ("", ""))
 
+    def test_a_malformed_request_does_not_stop_the_commands(self):
+        h = self.harness()
+        h.wait(lambda: h.state.get("hasAura"), what="started")
+        for bad in ({"id": None, "cmd": "get"}, {"id": [1], "cmd": "get"}, ["get"]):
+            h.bridge.stdin.write(json.dumps(bad) + "\n")
+        h.bridge.stdin.flush()
+        self.assertTrue(h.send("get")["ok"], "the bridge still answers after bad requests")
+
     def test_closing_stdin_stops_the_bridge(self):
         h = self.harness()
         h.wait(lambda: h.state.get("hasAura"), what="started")

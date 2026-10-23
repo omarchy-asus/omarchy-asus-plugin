@@ -1409,13 +1409,15 @@ class Bridge:
             args = msg.get("args", [])
             if not isinstance(args, list):
                 raise ValueError("args must be a list")
-        except (ValueError, AttributeError) as e:
+        except (ValueError, AttributeError, TypeError) as e:
             self.send({"type": "reply", "id": 0, "ok": False, "error": f"bad request: {e}"})
             return
         try:
             self.command(cmd, args)
             ok, err = True, ""
-        except (ValueError, IndexError, GLib.Error, OSError) as e:
+        except Exception as e:
+            # Anything that escapes here would also escape the stdin watch,
+            # which GLib then drops: the bridge would stop taking commands.
             ok, err = False, getattr(e, "message", None) or str(e)
             log(f"{cmd} {args}: {err}")
         self.ack = max(self.ack, cid)
