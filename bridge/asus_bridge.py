@@ -22,7 +22,7 @@ What it follows, all pushed, nothing on a timer:
 
 Per power source, from ~/.config/omarchy/omarchy-asus.conf (plain KEY=VALUE,
 never sourced):
-  KBD_AC / KBD_BATTERY                  off | low | med | high
+  KBD_AC / KBD_BATTERY                  off | low | med | high (battery default: off)
   HZ_AC / HZ_BATTERY / HZ_GAMING        refresh rate of the internal panel
   PANEL_OVERDRIVE_AC / _BATTERY         0 | 1
   INTERNAL_OUTPUT                       connector name, or desc:<EDID description>
@@ -100,6 +100,9 @@ LINE_POWER = 1  # UPower device type
 PROPS = "org.freedesktop.DBus.Properties"
 SYSTEMD = "org.freedesktop.systemd1"
 LEVELS = ["off", "low", "med", "high"]
+# The keyboard lights draw about 2 W at high, so on battery they are off
+# unless the settings say otherwise.
+LEVEL_DEFAULTS = {"KBD_BATTERY": "off"}
 SLASH_MODES = ["Static", "Bounce", "Slash", "Loading", "BitStream", "Transmission",
                "Flow", "Flux", "Phantom", "Spectrum", "Hazard", "Interfacing",
                "Ramp", "GameOver", "Start", "Buzzer"]
@@ -675,7 +678,7 @@ class Bridge:
 
     def level_conf(self, key):
         v = self.conf.get(key, "").lower()
-        return v if v in LEVELS else ""
+        return v if v in LEVELS else LEVEL_DEFAULTS.get(key, "")
 
     def emit(self):
         if self.emit_pending:
@@ -942,15 +945,16 @@ class Bridge:
 
     def apply(self, why, refresh_only=False):
         """Apply the settings for the current power source. Keys that are not
-        set are left alone. Gaming mode uses the AC keyboard and overdrive."""
+        set are left alone, except the keyboard on battery (off). Gaming mode
+        uses the AC keyboard and overdrive."""
         src = "AC" if gaming_on() and not pinned_hz() else self.source()
         log(f"apply ({why}): {self.kind}")
         self.apply_refresh()
         if refresh_only:
             return
         self.adjust_brightness()
-        level = self.conf.get("KBD_" + src, "").lower()
-        if level in LEVELS and self.aura:
+        level = self.level_conf("KBD_" + src)
+        if level and self.aura:
             self.set_level_now(level)
         od = self.conf.get("PANEL_OVERDRIVE_" + src, "")
         if od in ("0", "1") and self.overdrive:
