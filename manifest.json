@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.omarchy-asus.panel",
   "name": "omarchy-asus plugin",
-  "version": "1.6.2",
+  "version": "1.7.0",
   "author": "omarchy-asus",
   "description": "One panel for an ASUS laptop's hardware on Omarchy, from omarchy-asus (ASUS fixes for Omarchy: https://omarchy-asus.github.io): keyboard and lid Slash LEDs; per-charger keyboard, refresh rate, screen backlight and CPU power limits; battery charge limit; Fn+Super. Sections hide when the laptop doesn't have them. Event-driven, one bundled Python bridge, nothing to install on stock Omarchy. Written on the ROG Zephyrus G16.",
   "kinds": [

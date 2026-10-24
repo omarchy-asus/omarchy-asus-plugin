@@ -24,6 +24,8 @@ BRIDGE = os.path.join(HERE, "..", "bridge", "asus_bridge.py")
 FAKES = os.path.join(HERE, "fake_services.py")
 AURA = "/xyz/ljones/aura/19b6_3_4"
 OVERDRIVE = "/xyz/ljones/asus_armoury/panel_overdrive"
+BAT = "/org/freedesktop/UPower/devices/battery_BAT1"
+HELD = "omarchy-asus-charge-limit"
 
 CONF = """# test
 INTERNAL_OUTPUT=eDP-1
@@ -35,6 +37,7 @@ KBD_BATTERY=off
 PANEL_OVERDRIVE_AC=1
 PANEL_OVERDRIVE_BATTERY=0
 """
+HOLD = CONF + "CHARGE_HOLD_WEAK_BARREL=1\n"
 
 
 class FakeHyprland:
@@ -111,7 +114,8 @@ class FakeHyprland:
 
 class Harness:
     def __init__(self, conf=CONF, asusd=True, on_battery=False, charge_mode=None, bright=None,
-                 slash_getall_fails=False, state_files=None, before=None, giant_hyprland=False):
+                 slash_getall_fails=False, state_files=None, before=None, giant_hyprland=False,
+                 hold_quiet=None):
         self.tmp = tempfile.mkdtemp(prefix="g16b-")
         t = self.tmp
         self.home = os.path.join(t, "home")
@@ -172,6 +176,8 @@ class Harness:
             self.fake({"set": ["/org/freedesktop/UPower", "org.freedesktop.UPower", "OnBattery", "b", True]})
         self.env = dict(base, XDG_RUNTIME_DIR=self.run_dir, HYPRLAND_INSTANCE_SIGNATURE="SIG",
                         G16_BRIDGE_SYSROOT=self.sys, G16_BRIDGE_WINLOCK=self.winlock)
+        if hold_quiet is not None:
+            self.env["G16_BRIDGE_HOLD_QUIET_S"] = str(hold_quiet)
         self.out = queue.Queue()
         self.states = []
         self.replies = {}
@@ -245,6 +251,32 @@ class Harness:
         # Only the AC adapter device: a weak adapter dropping out and back.
         self.fake({"set": ["/org/freedesktop/UPower/devices/line_power_ACAD",
                            "org.freedesktop.UPower.Device", "Online", "b", online]})
+
+    def flap(self, times=3):
+        for _ in range(times):
+            self.adapter(False)
+            self.adapter(True)
+
+    def battery(self, prop, sig, value):
+        self.fake({"set": [BAT, "org.freedesktop.UPower.Device", prop, sig, value]})
+
+    def charge_sets(self):
+        return [s[4] for s in self.sets("ChargeControlEndThreshold")]
+
+    def state_file(self, name):
+        path = os.path.join(self.state_dir, name)
+        return open(path).read().strip() if os.path.exists(path) else None
+
+    def stderr(self):
+        with open(os.path.join(self.tmp, "bridge.err")) as f:
+            return f.read()
+
+    def switches(self):
+        n = 0
+        for task in os.listdir(f"/proc/{self.bridge.pid}/task"):
+            with open(f"/proc/{self.bridge.pid}/task/{task}/status") as f:
+                n += sum(int(x.split()[1]) for x in f if "ctxt_switches" in x)
+        return n
 
     def power(self, on_battery):
         self.fake({"set": ["/org/freedesktop/UPower", "org.freedesktop.UPower", "OnBattery", "b", on_battery]})
@@ -435,16 +467,9 @@ class BridgeTest(unittest.TestCase):
         # emitting PropertiesChanged (the G16 saw ~10 wakeups a minute).
         h.fake({"noise": True})
         time.sleep(1.5)
-
-        def switches():
-            n = 0
-            for task in os.listdir(f"/proc/{h.bridge.pid}/task"):
-                with open(f"/proc/{h.bridge.pid}/task/{task}/status") as f:
-                    n += sum(int(x.split()[1]) for x in f if "ctxt_switches" in x)
-            return n
-        before = switches()
+        before = h.switches()
         time.sleep(6)
-        self.assertEqual(switches() - before, 0, "the idle bridge woke up")
+        self.assertEqual(h.switches() - before, 0, "the idle bridge woke up")
 
     def test_usb_c_uses_the_battery_settings(self):
         h = self.harness(charge_mode=2)   # bit 1: USB-C, bit 0 (barrel) clear
@@ -580,6 +605,94 @@ class BridgeTest(unittest.TestCase):
                                         ("nv_dynamic_boost", 5)])
         self.assertEqual(len(h.hypr.evals), evals, "no refresh-rate flips")
         self.assertEqual(h.brightness(), 80, "a weak barrel keeps the AC settings: not dimmed")
+        self.assertEqual(h.charge_sets(), [], "no CHARGE_HOLD_WEAK_BARREL: charging isn't held")
+
+    # ---- charge hold on a weak barrel (#165) ----
+    def test_a_weak_barrel_holds_charging_until_the_load_drops(self):
+        # The G16 on a 140 W barrel, gaming while charging from 70 %: the
+        # adapter dropped out about once a second and the EC clamped the CPU.
+        h = self.harness(conf=HOLD, charge_mode=1, hold_quiet=3)
+        h.wait(lambda: h.state.get("source") == "ac" and h.state.get("chargeLimit") == 80, what="barrel")
+        h.flap()
+        h.wait(lambda: h.state.get("chargeHeld") == 50, what="charging held at the charge")
+        self.assertEqual(h.charge_sets(), [50])
+        self.assertEqual(h.state["chargeLimit"], 80, "the panel still shows the user's limit")
+        self.assertEqual(h.state_file(HELD), "80")
+        h.battery("Percentage", "d", 48.0)          # the load outruns the adapter: the charge falls
+        h.wait(lambda: h.state.get("chargeHeld") == 48, what="ceiling lowered with the charge")
+        for _ in range(4):                          # discharging on AC: the load is still there
+            time.sleep(1.2)
+            h.battery("State", "u", 2)
+        h.send("get")
+        self.assertEqual(h.state["chargeHeld"], 48, "held while the battery helps carry the load")
+        h.wait(lambda: h.state.get("chargeHeld") == 0, timeout=8, what="charging tried again")
+        self.assertEqual(h.charge_sets(), [50, 48, 80])
+        self.assertIsNone(h.state_file(HELD))
+        self.assertIn("charging resumed (quiet for 3 s): limit 80%", h.stderr())
+        # Released: the battery device is no longer followed.
+        h.fake({"noise": True})
+        time.sleep(1.5)
+        before = h.switches()
+        time.sleep(3)
+        self.assertEqual(h.switches() - before, 0, "the battery device still wakes the bridge")
+
+    def test_dropping_out_again_after_a_retry_holds_again_for_longer(self):
+        h = self.harness(conf=HOLD, charge_mode=1, hold_quiet=2)
+        h.wait(lambda: h.state.get("source") == "ac" and h.state.get("hasAura"), what="barrel")
+        h.flap()
+        h.wait(lambda: h.state.get("chargeHeld") == 50, what="held")
+        h.wait(lambda: h.state.get("chargeHeld") == 0, timeout=6, what="charging tried again")
+        h.flap(1)                                   # still too much: it drops out once more
+        h.wait(lambda: h.state.get("chargeHeld") == 50, what="held again")
+        self.assertEqual(h.charge_sets(), [50, 80, 50])
+        self.assertIn("trying again in 4 s", h.stderr())
+
+    def test_unplugging_a_held_weak_barrel_puts_the_limit_back(self):
+        h = self.harness(conf=HOLD, charge_mode=1)  # 2 min quiet spell: only the unplug ends it here
+        h.wait(lambda: h.state.get("source") == "ac" and h.state.get("hasAura"), what="barrel")
+        h.flap()
+        h.wait(lambda: h.state.get("chargeHeld") == 50, what="held")
+        h.power(True)
+        h.wait(lambda: h.state.get("chargeHeld") == 0, timeout=15, what="unplugged for good")
+        self.assertEqual(h.charge_sets(), [50, 80])
+        self.assertIsNone(h.state_file(HELD))
+
+    def test_no_hold_at_or_above_the_limit(self):
+        h = self.harness(conf=HOLD, charge_mode=1)
+        h.wait(lambda: h.state.get("source") == "ac" and h.state.get("hasAura"), what="barrel")
+        h.battery("Percentage", "d", 80.0)          # at the limit: not charging anyway
+        h.flap()
+        h.wait(lambda: h.state.get("source") == "weak", what="weak barrel")
+        self.assertEqual((h.charge_sets(), h.state["chargeHeld"]), ([], 0))
+
+    def test_a_limit_picked_while_held_is_the_one_that_comes_back(self):
+        h = self.harness(conf=HOLD, charge_mode=1)
+        h.wait(lambda: h.state.get("source") == "ac" and h.state.get("hasAura"), what="barrel")
+        h.flap()
+        h.wait(lambda: h.state.get("chargeHeld") == 50, what="held")
+        self.assertTrue(h.send("battery-limit", "100")["ok"])
+        self.assertEqual((h.state["chargeLimit"], h.state["chargeHeld"]), (100, 50))
+        self.assertEqual((h.charge_sets(), h.state_file(HELD)), ([50], "100"), "still held")
+        h.bridge.stdin.close()                      # the shell stops the bridge
+        self.assertEqual(h.bridge.wait(5), 0)
+        self.assertEqual(h.charge_sets(), [50, 100])
+        self.assertIsNone(h.state_file(HELD))
+
+    def test_a_limit_set_elsewhere_ends_the_hold(self):
+        h = self.harness(conf=HOLD, charge_mode=1)
+        h.wait(lambda: h.state.get("source") == "ac" and h.state.get("hasAura"), what="barrel")
+        h.flap()
+        h.wait(lambda: h.state.get("chargeHeld") == 50, what="held")
+        h.fake({"set": ["/xyz/ljones", "xyz.ljones.Platform", "ChargeControlEndThreshold", "y", 90]})
+        h.wait(lambda: h.state.get("chargeHeld") == 0 and h.state.get("chargeLimit") == 90, what="theirs stands")
+        self.assertEqual(h.charge_sets(), [50])
+        self.assertIsNone(h.state_file(HELD))
+
+    def test_a_limit_left_held_by_a_crash_is_put_back(self):
+        h = self.harness(state_files={HELD: "100\n"})
+        h.wait(lambda: h.state.get("chargeLimit") == 100, what="the saved limit back")
+        self.assertEqual(h.charge_sets(), [100])
+        self.assertIsNone(h.state_file(HELD))
 
     def test_profile_change_moves_the_curve(self):
         h = self.harness(conf=CONF + 'PPT_USBC="25 30 40"\n', charge_mode=2)

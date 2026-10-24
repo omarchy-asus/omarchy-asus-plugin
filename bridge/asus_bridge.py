@@ -13,7 +13,8 @@ What it follows, all pushed, nothing on a timer:
     (brightness, colour, power flags), the lid Slash bar, the battery charge
     limit and panel overdrive, through PropertiesChanged signals. asusd
     leaving or coming back is seen as a bus name change.
-  - UPower's OnBattery (system bus).
+  - UPower's OnBattery and its AC adapter devices (system bus); the battery
+    device only while charging is held on a weak barrel (below).
   - Hyprland's event socket: a monitor hotplug or a config reload re-applies
     monitors.lua, which puts the internal panel back on its native refresh
     rate, so both re-apply the per-source refresh rate.
@@ -35,12 +36,29 @@ never sourced):
   PPT_AC / PPT_USBC / PPT_WEAK_BARREL     "SPL SPPT FPPT" in W for that source
   BOOST_AC / BOOST_USBC / BOOST_WEAK_BARREL
                                         NVIDIA Dynamic Boost (W) for that source
+  CHARGE_HOLD_WEAK_BARREL               1 = hold charging on a weak barrel while
+                                        it can't carry the load and charge too
 A USB-C charger counts as battery: barrel = full power, USB-C and battery
 save. A barrel that drops out 3 or more times in 30 s (counted on UPower's
 line-power device: a flapping adapter doesn't flip OnBattery) is a weak barrel (a
 third-party adapter that can't carry the load): it keeps the AC settings and
 gets the PPT_WEAK_BARREL limits until it's unplugged for good. Power-source
 changes apply once the source has been stable for 1.5 s.
+
+Charge hold (CHARGE_HOLD_WEAK_BARREL=1): load plus charging asks more of a
+weak barrel than it gives, so it drops out about once a second and the EC
+clamps the CPU. While the barrel is weak, each time it comes back online
+the charge limit is set to the current charge (asusd's floor 20 %), which
+stops charging; the user's limit is kept in ~/.local/state/omarchy
+(omarchy-asus-charge-limit) and put back after a crash. While held, the
+battery device is followed: a falling charge lowers the ceiling with it,
+and the battery discharging on AC (the load is more than the adapter alone
+carries) keeps the hold. Held, the battery is idle whatever the load, so
+nothing reports the load dropping: after a quiet spell (2 min) the limit is
+put back and charging is tried again. If the barrel drops out again, the
+hold returns and the next quiet spell is twice as long (up to 30 min).
+Unplugging for good, a limit set elsewhere, or the key going away ends the
+hold. The quiet-spell timer exists only while charging is held.
 
 The PPT limits only take effect while the CPU custom fan curve is on (BIOS
 307 measured: a limit written in auto fan mode is stored but ignored, and
@@ -96,7 +114,8 @@ AURA = "xyz.ljones.Aura"
 SLASH = "xyz.ljones.Slash"
 UPOWER = "org.freedesktop.UPower"
 UPOWER_DEVICE = "org.freedesktop.UPower.Device"
-LINE_POWER = 1  # UPower device type
+LINE_POWER, BATTERY = 1, 2  # UPower device types
+DISCHARGING = 2             # UPower battery state
 PROPS = "org.freedesktop.DBus.Properties"
 SYSTEMD = "org.freedesktop.systemd1"
 LEVELS = ["off", "low", "med", "high"]
@@ -122,7 +141,7 @@ UNIT_STATES = {"active", "inactive", "failed", "activating", "deactivating", "re
 CONF_KEYS = {"PPT_AC", "PPT_USBC", "PPT_WEAK_BARREL", "BOOST_AC", "BOOST_USBC",
              "BOOST_WEAK_BARREL", "KBD_AC", "KBD_BATTERY", "HZ_AC", "HZ_BATTERY", "HZ_GAMING",
              "PANEL_OVERDRIVE_AC", "PANEL_OVERDRIVE_BATTERY", "INTERNAL_OUTPUT",
-             "BITDEPTH", "BRIGHT_BATTERY", "BRIGHT_DEVICE"}
+             "BITDEPTH", "BRIGHT_BATTERY", "BRIGHT_DEVICE", "CHARGE_HOLD_WEAK_BARREL"}
 LOGIND = "org.freedesktop.login1"
 PLATFORM = "xyz.ljones.Platform"
 FANCURVES = "xyz.ljones.FanCurves"
@@ -130,6 +149,8 @@ PPT_ATTRS = ["ppt_pl1_spl", "ppt_pl2_sppt", "ppt_pl3_fppt"]
 BOOST_ATTR = "nv_dynamic_boost"
 DEBOUNCE_MS = 1500
 WEAK_EDGES, WEAK_WINDOW, WEAK_CLEAR_S = 3, 30.0, 10
+CHARGE_FLOOR = 20                       # asusd refuses a lower charge limit
+HOLD_QUIET_MAX, HOLD_RETRY_S = 1800, 120
 
 
 def env(name, default=""):
@@ -152,6 +173,8 @@ WINLOCK_MODE_CONF = os.path.join(WINLOCK_DROPIN, "mode.conf")
 # the barrel backlight level saved when leaving it.
 SEEN_NAME, SAVED_NAME = "omarchy-asus.source", "omarchy-asus.bright-ac"
 CURVES_NAME, GROUPS_NAME = "omarchy-asus-ppt-curves", "omarchy-asus-ppt-groups"
+# The user's charge limit while charging is held on a weak barrel.
+HOLD_NAME = "omarchy-asus-charge-limit"
 # The names these files had before 1.6.0, renamed once (migrate_names).
 OLD_CONF_NAMES = {"power-tune.conf": CONF_NAME}
 OLD_STATE_NAMES = {"power-tune-hz": PIN_NAME, "power-tune-gaming": GAMING_NAME,
@@ -159,6 +182,7 @@ OLD_STATE_NAMES = {"power-tune-hz": PIN_NAME, "power-tune-gaming": GAMING_NAME,
                    "g16-ppt-curves": CURVES_NAME, "g16-ppt-groups": GROUPS_NAME}
 # Tests point these at a temp tree; on a real system they are the defaults.
 SYSROOT = env("G16_BRIDGE_SYSROOT", "/sys")
+HOLD_QUIET_S = int(env("G16_BRIDGE_HOLD_QUIET_S", "120"))
 WINLOCK_PATH = env("G16_BRIDGE_WINLOCK", WINLOCK_BIN)
 
 
@@ -599,6 +623,13 @@ class Bridge:
         self.fancurves = None     # path of xyz.ljones.FanCurves
         self.limits_on = False
         self.line_power = []      # UPower line-power device paths
+        self.battery = None       # UPower battery device path
+        self.battery_sub = 0      # its PropertiesChanged subscription, only while held
+        self.held = 0             # the charge ceiling we hold at, or 0
+        self.held_writes = set()  # ceilings written during this hold (their echoes are ours)
+        self.hold_timer = 0
+        self.hold_quiet = HOLD_QUIET_S
+        self.released_at = 0.0    # monotonic time charging was last tried again
         self.conf = read_conf()
         self.aura = None      # object path
         self.slash = None
@@ -646,6 +677,8 @@ class Bridge:
         if self.charge:
             charge = charge_limit_sysfs()
             charge = int(self.cache.get(self.charge, {}).get(CHARGE_PROP, charge) or charge)
+            if self.held:
+                charge = state_int(HOLD_NAME) or charge
         pin = pinned_hz()
         s = {
             "type": "state", "ack": self.ack,
@@ -663,6 +696,7 @@ class Bridge:
             "slashPattern": self.slash_pattern(slash),
             "slashModes": SLASH_MODES,
             "chargeLimit": charge,
+            "chargeHeld": self.held,
             "hasPanel": bool(self.output),
             "refreshHz": self.refresh_hz,
             "refreshOverride": str(pin) if pin else "auto",
@@ -797,12 +831,15 @@ class Bridge:
 
     def asusd_appeared(self, *_):
         self.discover()
+        self.restore_limit("asusd")
         self.apply("asusd")
         self.emit()
 
     def asusd_vanished(self, *_):
         self.aura = self.slash = self.charge = self.overdrive = None
         self.cache = {}
+        # The saved limit stays on disk: it goes back when asusd returns.
+        self.end_hold()
         self.emit()
 
     def props_changed(self, _conn, _sender, path, _iface, _signal, params):
@@ -813,12 +850,26 @@ class Bridge:
                 self.on_battery = bool(changed["OnBattery"])
                 # The adapter's own edges are counted where there is one.
                 self.power_edge(count=not self.line_power)
+                if not self.line_power and not self.on_battery:
+                    self.hold_charge("charger back online")
             self.emit()
             return
         if iface == UPOWER_DEVICE and path in self.line_power:
             if "Online" in changed:
                 self.power_edge(count=True)
+                if changed["Online"]:
+                    self.hold_charge("charger back online")
             return
+        if iface == UPOWER_DEVICE and path == self.battery:
+            self.battery_changed(changed)
+            return
+        if key == self.charge and CHARGE_PROP in changed and self.held:
+            v = int(changed[CHARGE_PROP])
+            if v not in self.held_writes:
+                # Someone else set the limit: theirs stands.
+                log(f"charge limit set to {v}% elsewhere; charge hold ended")
+                state_remove(HOLD_NAME)
+                self.end_hold()
         if iface == PLATFORM and "PlatformProfile" in changed and self.limits_on:
             # Omarchy switches the profile on a charger change: the curve
             # gate belongs to the new profile now.
@@ -858,7 +909,8 @@ class Bridge:
 
     def find_line_power(self):
         """UPower's line-power (AC adapter) devices. Their Online property
-        toggles each time a weak adapter drops out, while OnBattery may not."""
+        toggles each time a weak adapter drops out, while OnBattery may not.
+        The first battery device is noted for the charge hold."""
         out = []
         try:
             paths = self.call(self.system, UPOWER, "/org/freedesktop/UPower", UPOWER,
@@ -874,6 +926,8 @@ class Bridge:
                 continue
             if t == LINE_POWER:
                 out.append(path)
+            elif t == BATTERY and not self.battery:
+                self.battery = path
         return out
 
     def power_edge(self, count=True):
@@ -896,6 +950,7 @@ class Bridge:
                     self.weak = False
                     self.edges = []
                     log("weak barrel cleared")
+                    self.release_hold("unplugged")
                 return False
             self.weak_clear_timer = GLib.timeout_add_seconds(WEAK_CLEAR_S, clear)
         if self.debounce_timer:
@@ -960,6 +1015,8 @@ class Bridge:
         if od in ("0", "1") and self.overdrive:
             self.set_overdrive(int(od))
         self.apply_limits(why)
+        if self.held and not self.hold_wanted():
+            self.release_hold(why)
 
     # ---- per-source power limits (#34) ----
     def wanted_limits(self):
@@ -1088,6 +1145,130 @@ class Bridge:
             log(f"power limits for {self.kind} ({why}): ppt={ppt} boost={boost} profile={profile}")
         except (GLib.Error, OSError) as e:
             log(f"power limits ({why}): {getattr(e, 'message', e)}")
+
+    # ---- charge hold on a weak barrel (#165) ----
+    def hold_wanted(self):
+        return self.weak and bool(self.charge) and self.conf.get("CHARGE_HOLD_WEAK_BARREL", "") == "1"
+
+    def battery_percent(self):
+        if not self.battery:
+            return None
+        try:
+            v = self.call(self.system, UPOWER, self.battery, PROPS, "Get",
+                          GLib.Variant("(ss)", (UPOWER_DEVICE, "Percentage")), "(v)")
+            return float(v.unpack()[0])
+        except (GLib.Error, TypeError, ValueError) as e:
+            log(f"battery charge: {getattr(e, 'message', e)}")
+            return None
+
+    def user_limit(self):
+        v = self.cache.get(self.charge, {}).get(CHARGE_PROP) if self.charge else None
+        return int(v) if isinstance(v, int) and v > 0 else charge_limit_sysfs()
+
+    def set_ceiling(self, value):
+        path, iface = self.charge
+        self.held_writes.add(value)
+        v = self.raw_prop(path, iface, CHARGE_PROP)
+        self.set_prop(path, iface, CHARGE_PROP, GLib.Variant(v.get_type_string(), value))
+        self.held = value
+
+    def hold_charge(self, why):
+        """The weak barrel is back online after dropping out: hold charging at
+        the current charge, or, if it's held already, start the quiet spell
+        over (the load is still more than the barrel gives)."""
+        if not self.hold_wanted():
+            return
+        if self.held:
+            self.start_quiet()
+            return
+        pct, limit = self.battery_percent(), self.user_limit()
+        if pct is None or not limit:
+            return
+        ceiling = max(CHARGE_FLOOR, int(pct))
+        if ceiling >= limit:
+            return                      # at or above the limit: not charging anyway
+        # Dropping out again soon after charging was tried: wait longer next time.
+        now = GLib.get_monotonic_time() / 1e6
+        if self.released_at and now - self.released_at <= HOLD_RETRY_S:
+            self.hold_quiet = min(HOLD_QUIET_MAX, self.hold_quiet * 2)
+        else:
+            self.hold_quiet = HOLD_QUIET_S
+        try:
+            state_write(HOLD_NAME, str(limit))      # first, so a crash can't lose it
+            self.held_writes = set()
+            self.set_ceiling(ceiling)
+        except (GLib.Error, OSError) as e:
+            log(f"charge hold: {getattr(e, 'message', e)}")
+            self.held = 0
+            state_remove(HOLD_NAME)
+            return
+        # The battery device changes every few seconds: followed only while held.
+        self.battery_sub = self.system.signal_subscribe(UPOWER, PROPS, "PropertiesChanged", self.battery,
+                                                        None, Gio.DBusSignalFlags.NONE, self.props_changed)
+        self.start_quiet()
+        log(f"{why}: holding charging at {ceiling}% (limit {limit}%; trying again in {self.hold_quiet} s)")
+        self.emit()
+
+    def start_quiet(self):
+        if self.hold_timer:
+            GLib.source_remove(self.hold_timer)
+
+        def quiet():
+            self.hold_timer = 0
+            self.released_at = GLib.get_monotonic_time() / 1e6
+            self.release_hold(f"quiet for {self.hold_quiet} s")
+            return False
+        self.hold_timer = GLib.timeout_add_seconds(self.hold_quiet, quiet)
+
+    def battery_changed(self, changed):
+        if not self.held:
+            return
+        if changed.get("State") == DISCHARGING and not self.on_battery:
+            self.start_quiet()          # the load is more than the adapter alone carries
+        pct = changed.get("Percentage")
+        if isinstance(pct, (int, float)) and max(CHARGE_FLOOR, int(pct)) < self.held:
+            try:
+                self.set_ceiling(max(CHARGE_FLOOR, int(pct)))
+                log(f"charge fell under load: holding at {self.held}%")
+            except GLib.Error as e:
+                log(f"charge hold: {e.message}")
+            self.emit()
+
+    def release_hold(self, why):
+        """Put the user's limit back and stop following the battery."""
+        if not self.held:
+            return
+        self.end_hold()
+        self.restore_limit(why)
+
+    def end_hold(self):
+        if self.hold_timer:
+            GLib.source_remove(self.hold_timer)
+            self.hold_timer = 0
+        if self.battery_sub:
+            self.system.signal_unsubscribe(self.battery_sub)
+            self.battery_sub = 0
+        self.held = 0
+        self.held_writes = set()
+        self.emit()
+
+    def restore_limit(self, why):
+        """Put back the limit a hold saved: this one's, or one a crash or
+        asusd leaving cut short. Kept on disk until it's back."""
+        saved = state_int(HOLD_NAME)
+        if saved is None or not self.charge:
+            return
+        if CHARGE_FLOOR <= saved <= 100:
+            path, iface = self.charge
+            try:
+                v = self.raw_prop(path, iface, CHARGE_PROP)
+                if int(v.unpack()) != saved:
+                    self.set_prop(path, iface, CHARGE_PROP, GLib.Variant(v.get_type_string(), saved))
+                log(f"charging resumed ({why}): limit {saved}%")
+            except GLib.Error as e:
+                log(f"charge limit {saved}: {e.message}")
+                return
+        state_remove(HOLD_NAME)
 
     def adjust_brightness(self):
         """The backlight step, edge-triggered on the source class
@@ -1374,9 +1555,17 @@ class Bridge:
             n = int(a[0])
             if not 20 <= n <= 100:
                 raise ValueError(f"bad charge limit: {n}")
-            path, iface = self.charge
-            v = self.raw_prop(path, iface, CHARGE_PROP)
-            self.set_prop(path, iface, CHARGE_PROP, GLib.Variant(v.get_type_string(), n))
+            if self.held and n > self.held:
+                # Charging is held: this is the limit that comes back.
+                state_write(HOLD_NAME, str(n))
+            else:
+                if self.held:
+                    # At or below the charge: nothing left to hold.
+                    state_remove(HOLD_NAME)
+                    self.end_hold()
+                path, iface = self.charge
+                v = self.raw_prop(path, iface, CHARGE_PROP)
+                self.set_prop(path, iface, CHARGE_PROP, GLib.Variant(v.get_type_string(), n))
         elif cmd == "winlock-mode":
             self.set_winlock_mode(a[0])
         else:
@@ -1455,6 +1644,7 @@ class Bridge:
                           self.stdin_readable)
         self.emit()
         self.loop.run()
+        self.release_hold("bridge stopping")
 
 
 def cli(argv):
@@ -1470,12 +1660,14 @@ def cli(argv):
         print("hz override:", pin if pin else "auto")
     elif argv[0] == "release":
         # Before removing the plugin: turn off every fan curve and PPT tuning
-        # group the bridge turned on, so no power limit outlives it.
+        # group the bridge turned on, so no power limit outlives it, and put
+        # back a charge limit a hold left behind.
         b = Bridge()
         b.read_on_battery()
         b.discover()
         b.conf, b.limits_on = {}, True
         b.apply_limits("release")
+        b.restore_limit("release")
         left = b.read_groups()
         if left:
             print("still on (for another power state or profile; inert while their fan curve is off):",

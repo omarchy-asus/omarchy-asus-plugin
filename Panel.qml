@@ -161,6 +161,7 @@ Panel {
   // ---- battery charge ceiling (asusctl; sysfs is the source of truth) ----
   readonly property int chargeLimit: g ? g.chargeLimit : 0
   readonly property bool chargeAvailable: root.chargeLimit > 0
+  readonly property int chargeHeld: g ? g.chargeHeld : 0
   readonly property var chargeOptions: [
     { value: "60",  label: "60%"  },
     { value: "80",  label: "80%"  },
@@ -758,6 +759,18 @@ Panel {
               value: String(root.chargeLimit)
               live: true
               onPicked: function(v) { root.setChargeLimit(v) }
+            }
+
+            Text {
+              visible: root.chargeHeld > 0
+              textFormat: Text.PlainText
+              width: parent.width
+              text: "Holding at " + root.chargeHeld + "%: this charger can't carry the load "
+                  + "and charge too. Charging resumes when the load drops."
+              color: root.bar.foreground
+              font.family: root.bar.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
             }
 
             Text {

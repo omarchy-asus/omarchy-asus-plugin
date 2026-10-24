@@ -79,6 +79,8 @@ Item {
 
   // ---- battery ----
   property int chargeLimit: 0
+  // The ceiling charging is held at on a weak barrel (0: not held).
+  property int chargeHeld: 0
 
   // ---- Win-lock ----
   property bool hasWinlock: false
@@ -169,6 +171,7 @@ Item {
     svc.refreshOverride = String(s.refreshOverride || "auto")
     svc.gaming = s.gaming === true
     svc.chargeLimit = Number(s.chargeLimit) || 0
+    svc.chargeHeld = Number(s.chargeHeld) || 0
     svc.hasWinlock = s.hasWinlock === true
     svc.winlockMode = String(s.winlockMode || "toast")
     svc.winlockService = String(s.winlockService || "inactive")

@@ -81,6 +81,9 @@ UPOWER_XML = """
   <interface name="org.freedesktop.UPower.Device">
     <property name="Type" type="u" access="read"/>
     <property name="Online" type="b" access="read"/>
+    <property name="Percentage" type="d" access="read"/>
+    <property name="State" type="u" access="read"/>
+    <property name="EnergyRate" type="d" access="read"/>
   </interface>
 </node>"""
 ACAD = "/org/freedesktop/UPower/devices/line_power_ACAD"
@@ -127,7 +130,8 @@ values = {
     ("/org/freedesktop/UPower/devices/line_power_ACAD", "org.freedesktop.UPower.Device"): {
         "Type": GLib.Variant("u", 1), "Online": GLib.Variant("b", True)},
     ("/org/freedesktop/UPower/devices/battery_BAT1", "org.freedesktop.UPower.Device"): {
-        "Type": GLib.Variant("u", 2), "Online": GLib.Variant("b", False)},
+        "Type": GLib.Variant("u", 2), "Online": GLib.Variant("b", False), "Percentage": GLib.Variant("d", 50.0),
+        "State": GLib.Variant("u", 1), "EnergyRate": GLib.Variant("d", 40.0)},
     ("/org/freedesktop/systemd1/unit/g16_2dwinlock_2eservice", "org.freedesktop.systemd1.Unit"): {
         "ActiveState": GLib.Variant("s", "active")},
 }

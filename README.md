@@ -31,11 +31,11 @@ Update with `omarchy-plugin-update io.github.omarchy-asus.panel`; the shell relo
 ## Remove
 
 ```bash
-/usr/bin/python3 -I ~/.config/omarchy/plugins/io.github.omarchy-asus.panel/bridge/asus_bridge.py release   # only if you set power limits
+/usr/bin/python3 -I ~/.config/omarchy/plugins/io.github.omarchy-asus.panel/bridge/asus_bridge.py release   # only if you set power limits or the charge hold
 omarchy-plugin-remove io.github.omarchy-asus.panel
 ```
 
-`release` turns off the fan curves and asusd PPT tuning groups the plugin turned on for power limits, so no limit outlives it. The plugin leaves your settings in place; delete them if you want a clean slate:
+`release` turns off the fan curves and asusd PPT tuning groups the plugin turned on for power limits, so no limit outlives it, and puts back a charge limit a charge hold left behind. The plugin leaves your settings in place; delete them if you want a clean slate:
 - `~/.config/omarchy/omarchy-asus.conf`;
 - `~/.local/state/omarchy/omarchy-asus*`;
 - `~/.config/systemd/user/g16-winlock.service.d/mode.conf`, if you changed the Fn+Super mode.
@@ -73,6 +73,7 @@ a script):
 
 | `PPT_AC`, `PPT_USBC`, `PPT_WEAK_BARREL` | `"SPL SPPT FPPT"` in W, e.g. `"25 30 40"` | CPU power limits on that source (asus-armoury, through asusd), clamped to the firmware's range |
 | `BOOST_AC`, `BOOST_USBC`, `BOOST_WEAK_BARREL` | W | NVIDIA Dynamic Boost on that source |
+| `CHARGE_HOLD_WEAK_BARREL` | `1` | on a weak barrel, hold charging while the charger can't carry the load and charge too (below) |
 
 "AC" means the barrel charger. A USB-C charger gets the battery settings:
 UPower calls both chargers AC, so the widget tells them apart by asus-armoury's
@@ -81,6 +82,22 @@ more times in 30 s (a third-party adapter that can't carry the load) is a
 **weak barrel**: it keeps the AC settings and gets `PPT_WEAK_BARREL` until it's
 unplugged for good. Power-source changes apply once the source has been stable
 for 1.5 s, so a flapping adapter doesn't flip the refresh rate back and forth.
+
+**Holding charging on a weak barrel** (`CHARGE_HOLD_WEAK_BARREL=1`). Heavy load
+plus charging asks more of a weak barrel than it gives: it drops out about once
+a second and the EC clamps the CPU (on the G16 with a 140 W barrel, to 735 MHz
+while gaming). With this key, each time a weak barrel comes back online the
+widget sets the charge limit to the current charge, which stops charging; the
+panel says so, and your limit is kept in `~/.local/state/omarchy` and put back
+after a crash. While charging is held the widget follows the battery: if the
+charge falls under load the ceiling follows it down, and while the battery is
+discharging on AC the hold stays. With charging held, the battery reads the same
+under heavy and light load, so the widget tries charging again after two quiet
+minutes; if the barrel drops out again it holds again and waits twice as long
+next time (up to 30 minutes). Unplugging or removing the key puts your limit
+back; a limit set elsewhere (`asusctl battery limit`) replaces it and ends the
+hold. A limit picked in the panel while charging is held is the one that comes
+back.
 
 **Power limits and the fan curve.** On the GA605KM (BIOS 307) the firmware only
 applies PPT limits while the CPU custom fan curve is on; in auto fan mode a
