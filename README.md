@@ -49,7 +49,8 @@ omarchy-plugin-remove io.github.omarchy-asus.panel
   - `logind` `SetBrightness`: the screen backlight, only if you set `BRIGHT_BATTERY`.
 - **D-Bus (session bus):** the systemd user manager, to reload, enable and restart `g16-winlock.service` when you change the Fn+Super mode.
 - **Hyprland's IPC sockets:** the monitor list, `hl.monitor()` for the internal panel's refresh rate, and hotplug/reload events.
-- **Files:** it reads and writes only `~/.config/omarchy/omarchy-asus.conf`, `~/.local/state/omarchy/` and the Win-lock drop-in above.
+- **Files:** it reads and writes only `~/.config/omarchy/omarchy-asus.conf`, `~/.local/state/omarchy/` and the Win-lock drop-in above, and reads `~/.config/hypr/monitors.lua`.
+  - In `~/.local/state/omarchy/toggles/hypr/` it keeps one file, `omarchy-asus-refresh.lua`: the panel's refresh rate as an `hl.monitor()` line that Omarchy loads on every Hyprland reload. Only while the bridge runs, a rate is set and `monitors.lua` has a rule for the panel; the bridge removes it when it stops.
   - Directories are walked from `/` one component at a time without following symbolic links; each must be yours or a root-owned system directory.
   - Writes go to a new private temporary file that is atomically renamed into place.
   - A symbolic link is never read or written through: keep a real `omarchy-asus.conf` (copy it from your dotfiles), and the log says so if it is a link.
@@ -104,6 +105,21 @@ refresh pin (the panel's 60/240/Auto switch, stored in
 
 A monitor hotplug or `hyprctl reload` re-applies `monitors.lua`, which puts the
 panel back on its native rate; the widget sets the rate again after both.
+
+Give the panel a rule of its own in `~/.config/hypr/monitors.lua`, on one line,
+and a reload doesn't blank the panel twice (native rate, then the battery
+rate):
+
+```lua
+hl.monitor({ output = "eDP-1", mode = "preferred", position = "auto", scale = 1.6 })
+```
+
+The widget then changes only the panel's mode, merged into that rule, and keeps
+the rate in `~/.local/state/omarchy/toggles/hypr/omarchy-asus-refresh.lua`,
+which Omarchy loads after `monitors.lua` on every reload. So a reload already
+carries the rate and leaves the panel alone. With only the catch-all rule
+(`output = ""`), the widget sets the panel's whole mode after each reload, as
+before: a rule of its own for the panel would drop the catch-all's scale.
 
 The widget also works without asusd: the keyboard, Slash, charge limit and
 power limit sections hide, and the refresh rate, screen dimming and Fn+Super

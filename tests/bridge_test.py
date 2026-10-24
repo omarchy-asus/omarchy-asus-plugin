@@ -334,6 +334,52 @@ class BridgeTest(unittest.TestCase):
         h.wait(lambda: len(h.hypr.evals) == n + 2 and h.hypr.hz == 60, what="re-applied after hotplug")
         self.assertEqual(len(h.sets("Brightness")), brightness_sets, "a Hyprland event only touches the refresh rate")
 
+    def panel_rule(self, h):
+        d = os.path.join(h.home, ".config", "hypr")
+        os.makedirs(d)
+        with open(os.path.join(d, "monitors.lua"), "w") as f:
+            f.write('hl.monitor({ output = "", mode = "preferred", position = "auto", scale = "auto" })\n'
+                    '-- hl.monitor({ output = "DP-2", mode = "2560x1440@144" })\n'
+                    'hl.monitor({ output = "eDP-1", mode = "2560x1600@240", position = "0x0", scale = 1.6 })\n')
+
+    def rate_rule(self, h):
+        try:
+            with open(os.path.join(h.state_dir, "toggles", "hypr", "omarchy-asus-refresh.lua")) as f:
+                return f.read()
+        except FileNotFoundError:
+            return None
+
+    def test_reload_carries_the_rate_when_monitors_lua_has_a_panel_rule(self):
+        h = self.harness(before=self.panel_rule)
+        h.wait(lambda: h.state.get("refreshHz") == 240 and h.state.get("hasAura"), what="AC applied")
+        # Only the mode, merged into the panel's own rule: no explicit scale or
+        # bit depth that the reloaded rule wouldn't carry.
+        self.assertEqual(h.hypr.evals, ['hl.monitor({ output = "eDP-1", mode = "2560x1600@240" })'])
+        self.assertIn('\nhl.monitor({ output = "eDP-1", mode = "2560x1600@240" })\n', self.rate_rule(h))
+        h.power(True)
+        h.wait(lambda: h.state.get("refreshHz") == 60 and self.rate_rule(h) and "@60\"" in self.rate_rule(h),
+               what="battery rate and rule")
+        h.hypr.event("configreloaded>>")   # the reload loaded the rule: still 60
+        time.sleep(1.5)
+        h.pump(0.1)
+        self.assertEqual(len(h.hypr.evals), 2, "no second modeset after a reload")
+        h.bridge.stdin.close()
+        h.bridge.wait(5)
+        self.assertIsNone(self.rate_rule(h), "no rule outlives the bridge")
+
+    def test_no_rate_rule_without_a_panel_rule_or_a_rate(self):
+        h = self.harness()
+        h.wait(lambda: h.state.get("refreshHz") == 240 and h.state.get("hasAura"), what="AC applied")
+        self.assertIn('position = "0x0", scale = 1.6, bitdepth = 10', h.hypr.evals[0])
+        self.assertIsNone(self.rate_rule(h), "a new panel rule would drop the catch-all's scale")
+        self.panel_rule(h)
+        os.makedirs(os.path.join(h.state_dir, "toggles", "hypr"))
+        with open(os.path.join(h.state_dir, "toggles", "hypr", "omarchy-asus-refresh.lua"), "w") as f:
+            f.write("-- left over\n")
+        with open(h.conf, "w") as f:
+            f.write("INTERNAL_OUTPUT=eDP-1\n")   # no HZ_* keys: no rate to keep
+        h.wait(lambda: self.rate_rule(h) is None, what="stale rule removed")
+
     def test_pin_beats_gaming_beats_power_source(self):
         h = self.harness()
         h.wait(lambda: h.state.get("refreshHz") == 240, what="AC applied")

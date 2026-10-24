@@ -16,7 +16,11 @@ What it follows, all pushed, nothing on a timer:
   - UPower's OnBattery (system bus).
   - Hyprland's event socket: a monitor hotplug or a config reload re-applies
     monitors.lua, which puts the internal panel back on its native refresh
-    rate, so both re-apply the per-source refresh rate.
+    rate, so both re-apply the per-source refresh rate. When monitors.lua has
+    a rule of its own for the panel, the rate also goes into Omarchy's
+    generated toggles (~/.local/state/omarchy/toggles/hypr/
+    omarchy-asus-refresh.lua, loaded after monitors.lua and merged into that
+    rule), so a reload already carries it and doesn't modeset the panel twice.
   - The keyboard LED's brightness_hw_changed (Fn+F2/F3 bypass asusd), and
     the settings and state files below, through inotify.
 
@@ -152,6 +156,8 @@ WINLOCK_MODE_CONF = os.path.join(WINLOCK_DROPIN, "mode.conf")
 # the barrel backlight level saved when leaving it.
 SEEN_NAME, SAVED_NAME = "omarchy-asus.source", "omarchy-asus.bright-ac"
 CURVES_NAME, GROUPS_NAME = "omarchy-asus-ppt-curves", "omarchy-asus-ppt-groups"
+# The panel's rate as a Hyprland rule that Omarchy loads on every reload.
+RATE_RULE_NAME = "omarchy-asus-refresh.lua"
 # The names these files had before 1.6.0, renamed once (migrate_names).
 OLD_CONF_NAMES = {"power-tune.conf": CONF_NAME}
 OLD_STATE_NAMES = {"power-tune-hz": PIN_NAME, "power-tune-gaming": GAMING_NAME,
@@ -336,6 +342,45 @@ def state_dir(create=True):
 
 def dropin_dir(create=True):
     return Dir(CONFIG_HOME, ["systemd", "user", WINLOCK_UNIT + ".d"], create)
+
+
+def toggles_dir(create=True):
+    return Dir(STATE_HOME, ["omarchy", "toggles", "hypr"], create)
+
+
+def hypr_config_dir():
+    return Dir(CONFIG_HOME, ["hypr"], create=False)
+
+
+def panel_rule_in_monitors_lua(output):
+    """Whether ~/.config/hypr/monitors.lua has an hl.monitor() line naming
+    this output (the same line match Omarchy's clamshell script uses). Only
+    then does a mode-only rule merge into the user's rule; anything else
+    (a desc: rule, a multi-line call, only the catch-all rule) answers no."""
+    try:
+        with hypr_config_dir() as d:
+            text = d.read("monitors.lua")
+    except OSError:
+        return False
+    pat = re.compile(r'\s*hl\.monitor\(\s*\{.*\boutput\s*=\s*"%s"' % re.escape(output))
+    return bool(text) and any(pat.match(line) for line in text.splitlines())
+
+
+def write_rate_rule(text):
+    """Keep RATE_RULE_NAME at `text` (None removes it). Written only when it
+    changes: Hyprland reloads when a file it loaded is rewritten."""
+    try:
+        with toggles_dir(create=text is not None) as d:
+            if text is None:
+                if d.is_file(RATE_RULE_NAME):
+                    d.remove(RATE_RULE_NAME)
+                    log(f"removed {RATE_RULE_NAME}")
+            elif d.read(RATE_RULE_NAME) != text:
+                d.write(RATE_RULE_NAME, text)
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        log(f"{RATE_RULE_NAME}: {e}")
 
 
 def state_read(name):
@@ -1177,17 +1222,35 @@ class Bridge:
     def apply_refresh(self):
         m = self.read_monitors()
         hz = self.target_hz()
-        if not m or not self.output or not hz or hz == self.refresh_hz:
+        if not m or not self.output:
             return
+        # With a panel rule in monitors.lua, set only the mode (and BITDEPTH
+        # if set): Hyprland merges it into that rule, field by field, both
+        # now and from the generated rule on every reload. The reloaded rule
+        # then matches the active one and the panel isn't modeset again (an
+        # explicit scale or bit depth the user's rule doesn't carry would
+        # differ, and both are modeset properties). Without one, a new rule
+        # for the panel would drop the catch-all's scale, so it stays as
+        # before: the whole live mode now, set again after each reload.
+        own = panel_rule_in_monitors_lua(self.output)
         depth = self.conf.get("BITDEPTH", "")
-        if not depth.isdigit():
-            depth = "10" if "2101010" in str(m.get("currentFormat", "")) else "8"
         try:
-            scale = round(float(m.get("scale", 1)), 6)
-            lua = ('hl.monitor({ output = "%s", mode = "%dx%d@%d", position = "%dx%d", scale = %s, bitdepth = %s })'
-                   % (self.output, int(m["width"]), int(m["height"]), hz,
-                      int(m["x"]), int(m["y"]), scale, depth))
+            mode = "%dx%d@%d" % (int(m["width"]), int(m["height"]), hz) if hz else ""
+            if own:
+                lua = 'hl.monitor({ output = "%s", mode = "%s"%s })' % (
+                    self.output, mode, ", bitdepth = %s" % depth if depth.isdigit() else "")
+            else:
+                if not depth.isdigit():
+                    depth = "10" if "2101010" in str(m.get("currentFormat", "")) else "8"
+                lua = ('hl.monitor({ output = "%s", mode = "%s", position = "%dx%d", scale = %s, bitdepth = %s })'
+                       % (self.output, mode, int(m["x"]), int(m["y"]),
+                          round(float(m.get("scale", 1)), 6), depth))
         except (KeyError, TypeError, ValueError):
+            return
+        write_rate_rule("-- Written by the omarchy-asus plugin, rewritten as the power source changes:\n"
+                        "-- the internal panel's refresh rate, so a Hyprland reload keeps it.\n"
+                        + lua + "\n" if own and hz else None)
+        if not hz or hz == self.refresh_hz:
             return
         prev = self.refresh_hz
         log(f"{self.output} {prev}Hz -> {hz}Hz")
@@ -1455,6 +1518,9 @@ class Bridge:
                           self.stdin_readable)
         self.emit()
         self.loop.run()
+        # Stopped (the shell stopped the service, or the plugin was removed):
+        # leave no rate rule behind to pin the panel without us.
+        write_rate_rule(None)
 
 
 def cli(argv):
@@ -1476,6 +1542,7 @@ def cli(argv):
         b.discover()
         b.conf, b.limits_on = {}, True
         b.apply_limits("release")
+        write_rate_rule(None)
         left = b.read_groups()
         if left:
             print("still on (for another power state or profile; inert while their fan curve is off):",
