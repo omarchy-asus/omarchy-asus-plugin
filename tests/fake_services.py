@@ -13,6 +13,9 @@ appended to $FAKE_LOG as a JSON line. Commands arrive on stdin as JSON lines:
   {"refuse": [name, ...]}                          fail every Set of these properties and every call of these
                                                    methods, as asusd or logind do when the write fails
                                                    ([] accepts them again)
+  {"lose": [name, ...]}                            apply every Set of these properties and every call of these
+                                                   methods, then never reply, so the caller's call times out
+                                                   not knowing it landed ([] replies again)
 FAKE_REFUSE=prop,... refuses those Sets from the start.
 FAKE_SLASH_GETALL_FAILS=1 makes GetAll on the Slash interface fail, the way asusd's
 zbus fails the whole call when one getter errors.
@@ -321,8 +324,30 @@ def refuse_filter(conn, msg, incoming):
     return msg
 
 
-system.add_filter(refuse_filter)
-upower.add_filter(refuse_filter)
+losing = set()
+lost = set()
+
+
+def lose_filter(conn, msg, incoming):
+    """Lets a call in and drops its reply: the write lands, the caller only
+    sees its call time out."""
+    kind = msg.get_message_type()
+    if incoming and losing and kind == Gio.DBusMessageType.METHOD_CALL:
+        name = msg.get_member()
+        if msg.get_interface() == "org.freedesktop.DBus.Properties" and name == "Set" and msg.get_body():
+            name = msg.get_body().unpack()[1]
+        if name in losing:
+            log({"lost-reply": name})
+            lost.add(msg.get_serial())
+    elif not incoming and kind == Gio.DBusMessageType.METHOD_RETURN and msg.get_reply_serial() in lost:
+        lost.discard(msg.get_reply_serial())
+        return None
+    return msg
+
+
+for conn in (system, upower):
+    conn.add_filter(refuse_filter)
+    conn.add_filter(lose_filter)
 
 own(upower, "org.freedesktop.UPower")
 own(upower, "org.freedesktop.login1")
@@ -367,6 +392,9 @@ def stdin_cb(fd, cond):
         elif "refuse" in msg:
             refusing.clear()
             refusing.update(msg["refuse"])
+        elif "lose" in msg:
+            losing.clear()
+            losing.update(msg["lose"])
         elif "noise" in msg:
             nm = Gio.DBusConnection.new_for_address_sync(
                 os.environ["DBUS_SYSTEM_BUS_ADDRESS"],

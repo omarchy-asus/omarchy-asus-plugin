@@ -217,6 +217,17 @@ def dbus_int(variant, lo, hi):
     return None if v is None else int(v)
 
 
+def unanswered(e):
+    """A D-Bus call that failed without an answer (its reply timed out, or
+    the connection closed): it may have been carried out all the same."""
+    return (e.matches(Gio.io_error_quark(), Gio.IOErrorEnum.TIMED_OUT)
+            or e.matches(Gio.io_error_quark(), Gio.IOErrorEnum.CLOSED)
+            or e.matches(Gio.DBusError.quark(), Gio.DBusError.NO_REPLY)
+            or e.matches(Gio.DBusError.quark(), Gio.DBusError.TIMEOUT)
+            or e.matches(Gio.DBusError.quark(), Gio.DBusError.TIMED_OUT)
+            or e.matches(Gio.DBusError.quark(), Gio.DBusError.DISCONNECTED))
+
+
 def digits(s, hi=999999999):
     """s as an int when it is 1-9 ASCII digits and at most hi, else None.
     Files and settings are parsed with this, never isdigit(): "²".isdigit()
@@ -1146,6 +1157,8 @@ class Bridge:
             self.call(self.system, ASUSD, mgr[0], mgr[1], "SetProfileFanCurveEnabled",
                       GLib.Variant("(usb)", (profile, "CPU", on)))
         except GLib.Error as e:
+            if unanswered(e):
+                raise                   # it may have landed: kept recorded, tried again next apply
             log(f"CPU fan curve for profile {profile} -> {on}: {e.message}; trying all fans")
             self.call(self.system, ASUSD, mgr[0], mgr[1], "SetFanCurvesEnabled",
                       GLib.Variant("(ub)", (profile, on)))
@@ -1335,14 +1348,22 @@ class Bridge:
         try:
             if not pending:
                 state_write(HOLD_NAME, str(limit))  # first, so a crash can't lose it
-            self.held_writes = set()
+        except OSError as e:
+            log(f"charge hold: {e}")
+            return                              # nothing saved, so nothing written
+        self.held_writes = set()
+        try:
             self.set_ceiling(ceiling)
-        except (GLib.Error, OSError) as e:
-            log(f"charge hold: {getattr(e, 'message', e)}")
-            self.held = 0
-            if not pending:
-                state_remove(HOLD_NAME)         # ours, and the limit never moved
-            return
+        except GLib.Error as e:
+            # A failed write may still have landed (asusd applied it, then
+            # its reply timed out). The saved limit goes only once reading
+            # asusd back shows it in place; until then this is a hold like
+            # any other, tried again after the quiet spell.
+            log(f"charge hold: {e.message}")
+            if self.restore_limit("charge hold failed"):
+                return
+            self.held = ceiling
+            why += " (unconfirmed)"
         # The battery device changes every few seconds: followed only while held.
         self.battery_sub = self.system.signal_subscribe(UPOWER, PROPS, "PropertiesChanged", self.battery,
                                                         None, Gio.DBusSignalFlags.NONE, self.props_changed)
@@ -1741,7 +1762,12 @@ class Bridge:
                 # replaces a saved limit, but only once asusd has taken it.
                 path, iface = self.charge
                 v = self.raw_prop(path, iface, CHARGE_PROP)
-                self.set_prop(path, iface, CHARGE_PROP, GLib.Variant(v.get_type_string(), n))
+                try:
+                    self.set_prop(path, iface, CHARGE_PROP, GLib.Variant(v.get_type_string(), n))
+                except GLib.Error:
+                    # It may have landed all the same: asusd read back decides.
+                    if dbus_int(self.raw_prop(path, iface, CHARGE_PROP), 0, 100) != n:
+                        raise
                 state_remove(HOLD_NAME)
                 if self.held:
                     self.end_hold()
