@@ -802,13 +802,13 @@ class BridgeTest(unittest.TestCase):
         h.battery("Percentage", "d", 45.0)
         h.flap()                                    # a hold the firmware refuses
         h.wait(lambda: "charge hold: " in h.stderr(), what="the hold refused")
-        self.assertEqual(h.state_file(HELD), "80", "a failed hold leaves the saved limit alone")
-        h.fake({"refuse": []})
-        h.flap(1)
-        h.wait(lambda: h.state.get("chargeHeld") == 45, what="held")
+        # Neither the hold nor putting 80 back was confirmed: it counts as
+        # held, and the quiet spell tries again.
+        h.wait(lambda: h.state.get("chargeHeld") == 45, what="held, unconfirmed")
         self.assertEqual(h.state_file(HELD), "80", "the saved limit, not asusd's 50")
+        h.fake({"refuse": []})
         h.wait(lambda: h.state.get("chargeHeld") == 0, timeout=6, what="charging tried again")
-        self.assertEqual(h.charge_sets(), [45, 80])
+        self.assertEqual((h.charge_sets(), h.state["chargeLimit"]), ([80], 80))
         self.assertIsNone(h.state_file(HELD))
 
     def test_a_lower_limit_asusd_refuses_keeps_the_hold_and_the_saved_limit(self):
@@ -824,6 +824,92 @@ class BridgeTest(unittest.TestCase):
         self.assertTrue(h.send("battery-limit", "40")["ok"])
         self.assertEqual((h.state["chargeHeld"], h.state_file(HELD)), (0, None), "the user's choice replaces it")
         self.assertEqual(h.charge_sets(), [50, 40])
+
+    # A write whose reply never comes may still have landed (asusd applied
+    # it, then the reply timed out): only reading asusd back decides.
+    def test_a_hold_whose_reply_is_lost_keeps_the_saved_limit(self):
+        h = self.harness(conf=HOLD, charge_mode=1, hold_quiet=2)
+        h.wait(lambda: h.state.get("source") == "ac" and h.state.get("chargeLimit") == 80, what="barrel")
+        h.fake({"lose": ["ChargeControlEndThreshold"]})
+        h.flap()
+        h.wait(lambda: "charge hold: " in h.stderr(), timeout=8, what="the hold's reply lost")
+        self.assertEqual(h.charge_sets()[:1], [50], "asusd took the ceiling")
+        self.assertEqual(h.state_file(HELD), "80", "so the user's limit stays saved")
+        h.fake({"lose": []})
+        h.wait(lambda: h.state.get("chargeHeld") == 0 and h.state.get("chargeLimit") == 80
+               and h.state_file(HELD) is None, timeout=15, what="80 back")
+        self.assertEqual(h.charge_sets()[-1], 80)
+
+    def test_a_hold_whose_reply_is_lost_and_the_restore_refused_is_put_back_later(self):
+        h = self.harness(conf=HOLD, charge_mode=1, hold_quiet=2)
+        h.wait(lambda: h.state.get("source") == "ac" and h.state.get("chargeLimit") == 80, what="barrel")
+        h.fake({"lose": ["ChargeControlEndThreshold"]})
+        h.flap()
+        h.wait(lambda: any(c.get("lost-reply") for c in h.calls()), what="the hold's Set in")
+        h.fake({"lose": []})
+        h.fake({"refuse": ["ChargeControlEndThreshold"]})
+        h.wait(lambda: "charge limit 80:" in h.stderr(), timeout=8, what="the restore refused")
+        h.send("get")
+        self.assertEqual((h.state["chargeHeld"], h.state_file(HELD)), (50, "80"), "held at what asusd has")
+        h.fake({"refuse": []})
+        h.wait(lambda: h.state.get("chargeHeld") == 0 and h.state_file(HELD) is None, timeout=8,
+               what="tried again after the quiet spell")
+        self.assertEqual((h.charge_sets(), h.state["chargeLimit"]), ([50, 80], 80))
+
+    def test_a_lower_limit_whose_reply_is_lost_but_landed_stands(self):
+        h = self.harness(conf=HOLD, charge_mode=1)
+        h.wait(lambda: h.state.get("source") == "ac" and h.state.get("hasAura"), what="barrel")
+        h.flap()
+        h.wait(lambda: h.state.get("chargeHeld") == 50, what="held")
+        h.fake({"lose": ["ChargeControlEndThreshold"]})
+        self.assertTrue(h.send("battery-limit", "40")["ok"], "asusd has 40: the panel isn't told it failed")
+        h.fake({"lose": []})
+        h.wait(lambda: h.state.get("chargeHeld") == 0, what="hold ended")
+        self.assertEqual((h.charge_sets(), h.state_file(HELD), h.state["chargeLimit"]), ([50, 40], None, 40))
+
+    def test_a_group_whose_reply_is_lost_stays_recorded(self):
+        h = self.harness(conf=CONF + 'PPT_USBC="25 30 40"\n', charge_mode=2, on_battery=True)
+        h.wait(lambda: h.state.get("hasAura"), what="started on battery")
+        h.fake({"lose": ["EnablePptGroup"]})
+        h.power(False)
+        h.wait(lambda: "power limits (" in h.stderr(), timeout=8, what="the group's reply lost")
+        self.assertEqual((h.group_sets(), h.state_file("omarchy-asus-ppt-groups")),
+                         ([[True, "plugged", 0]], "ac 0"), "it reads on, so it stays ours")
+        h.fake({"lose": []})
+        h.power(True)
+        h.power(False)
+        h.wait(lambda: len(h.ppt_sets()) == 3, what="USB-C limits")
+        self.assertEqual(h.state_file("omarchy-asus-ppt-groups"), "ac 0")
+
+    def test_a_curve_whose_reply_is_lost_is_not_widened_to_every_fan(self):
+        h = self.harness(conf=CONF + 'PPT_USBC="25 30 40"\n', charge_mode=2, on_battery=True)
+        h.wait(lambda: h.state.get("hasAura"), what="started on battery")
+        h.fake({"lose": ["SetProfileFanCurveEnabled"]})
+        h.power(False)
+        h.wait(lambda: "power limits (" in h.stderr(), timeout=8, what="the curve's reply lost")
+        self.assertEqual(h.curve_calls(), [[0, "CPU", True]], "no fallback that turns on every fan's curve")
+        self.assertEqual(h.state_file("omarchy-asus-ppt-curves"), "0", "kept recorded")
+        h.fake({"lose": []})
+        h.power(True)
+        h.wait(lambda: h.curve_calls()[-1:] == [[0, "CPU", False]], what="curve off")
+        self.assertEqual(h.state_file("omarchy-asus-ppt-curves"), "")
+
+    def test_a_curve_whose_off_reply_is_lost_is_turned_off_again(self):
+        # Turning a curve off twice is harmless, so the retry makes the call
+        # again rather than reading the curve back first.
+        h = self.harness(conf=CONF + 'PPT_USBC="25 30 40"\n', charge_mode=2, on_battery=True)
+        h.wait(lambda: h.state.get("hasAura"), what="started on battery")
+        h.power(False)
+        h.wait(lambda: len(h.ppt_sets()) == 3, what="USB-C limits")
+        h.fake({"lose": ["SetProfileFanCurveEnabled"]})
+        h.power(True)
+        h.wait(lambda: h.curve_calls()[-1:] == [[0, "CPU", False]], what="the off call")
+        h.wait(lambda: "power limits (" in h.stderr(), timeout=8, what="its reply lost")
+        self.assertEqual(h.state_file("omarchy-asus-ppt-curves"), "0", "kept recorded")
+        h.fake({"lose": []})
+        h.fake({"set": ["/xyz/ljones", "xyz.ljones.Platform", "PlatformProfile", "u", 3]})
+        h.wait(lambda: h.curve_calls()[-2:] == [[0, "CPU", False], [0, "CPU", False]], what="off again")
+        h.wait(lambda: h.state_file("omarchy-asus-ppt-curves") == "", what="record dropped")
 
     def test_profile_change_moves_the_curve(self):
         h = self.harness(conf=CONF + 'PPT_USBC="25 30 40"\n', charge_mode=2)

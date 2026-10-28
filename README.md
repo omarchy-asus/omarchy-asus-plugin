@@ -99,9 +99,12 @@ minutes; if the barrel drops out again it holds again and waits twice as long
 next time (up to 30 minutes). Unplugging or removing the key puts your limit
 back; a limit set elsewhere (`asusctl battery limit`) replaces it and ends the
 hold. A limit picked in the panel while charging is held is the one that comes
-back. Your limit stays saved until asusd has actually taken it back: if asusd
-refuses, charging stays held and the widget tries again after the next quiet
-spell.
+back. Your limit stays saved until asusd has taken it back: putting it back
+counts once asusd answers that it's done, or once the limit already reads as
+yours. A write asusd doesn't answer in time may still have landed, so when
+starting a hold goes unanswered the widget reads the limit back from asusd to
+decide. If asusd refuses, or doesn't answer in time, charging counts as held and
+the widget tries again after the next quiet spell.
 
 **Power limits and the fan curve.** On the GA605KM (BIOS 307) the firmware only
 applies PPT limits while the CPU custom fan curve is on; in auto fan mode a
