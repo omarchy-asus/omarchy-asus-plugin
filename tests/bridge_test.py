@@ -894,6 +894,23 @@ class BridgeTest(unittest.TestCase):
         h.wait(lambda: h.curve_calls()[-1:] == [[0, "CPU", False]], what="curve off")
         self.assertEqual(h.state_file("omarchy-asus-ppt-curves"), "")
 
+    def test_a_curve_whose_off_reply_is_lost_is_turned_off_again(self):
+        # Turning a curve off twice is harmless, so the retry makes the call
+        # again rather than reading the curve back first.
+        h = self.harness(conf=CONF + 'PPT_USBC="25 30 40"\n', charge_mode=2, on_battery=True)
+        h.wait(lambda: h.state.get("hasAura"), what="started on battery")
+        h.power(False)
+        h.wait(lambda: len(h.ppt_sets()) == 3, what="USB-C limits")
+        h.fake({"lose": ["SetProfileFanCurveEnabled"]})
+        h.power(True)
+        h.wait(lambda: h.curve_calls()[-1:] == [[0, "CPU", False]], what="the off call")
+        h.wait(lambda: "power limits (" in h.stderr(), timeout=8, what="its reply lost")
+        self.assertEqual(h.state_file("omarchy-asus-ppt-curves"), "0", "kept recorded")
+        h.fake({"lose": []})
+        h.fake({"set": ["/xyz/ljones", "xyz.ljones.Platform", "PlatformProfile", "u", 3]})
+        h.wait(lambda: h.curve_calls()[-2:] == [[0, "CPU", False], [0, "CPU", False]], what="off again")
+        h.wait(lambda: h.state_file("omarchy-asus-ppt-curves") == "", what="record dropped")
+
     def test_profile_change_moves_the_curve(self):
         h = self.harness(conf=CONF + 'PPT_USBC="25 30 40"\n', charge_mode=2)
         h.wait(lambda: h.curve_calls() == [[0, "CPU", True]], what="curve on, profile 0")
