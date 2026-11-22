@@ -1079,6 +1079,8 @@ class Bridge:
         1.5 s, so a flapping adapter doesn't re-apply (and modeset) on every
         edge."""
         now = GLib.get_monotonic_time() / 1e6
+        # Only a barrel's dropouts count: a dock's don't make a weak barrel.
+        count = count and self.kind in ("ac", "weak")
         self.edges = [t for t in self.edges if now - t <= WEAK_WINDOW] + ([now] if count else [])
         if not self.on_battery and len(self.edges) >= WEAK_EDGES and not self.weak:
             self.weak = True
@@ -1113,22 +1115,24 @@ class Bridge:
 
     def settle(self):
         """Read the firmware once and act on that one sample. While it is
-        still classifying a charger (charge_mode 0) the last source stands
-        (off battery: AC), the work is done with that, and the firmware is
-        read again every 250 ms, at most 8 times, applying if the answer
-        changes the source; a UPower edge starts the count again."""
+        still classifying a charger (charge_mode 0) it is read again every
+        250 ms, at most 8 times (a UPower edge starts the count again), and
+        the work waits; if it never says, the last source stands (off
+        battery: AC)."""
         self.debounce_timer = 0
         kind, sure = self.read_kind()
-        work, self.pending = self.pending, {}
         if not sure:
-            kind = "ac" if self.kind == "battery" else self.kind
             if self.kind_tries < 8:
+                # Nothing is done on a 0: the work waits for a definite read.
                 self.kind_tries += 1
                 self.debounce_timer = GLib.timeout_add(250, self.settle)
-        why = work.get("full") or next(iter(work.values()), "power source")
+                return False
+            kind = "ac" if self.kind == "battery" else self.kind
+        work, self.pending = self.pending, {}
+        why = work.get("full") or next(iter(work.values()), "charger")
         if self.set_kind(kind):
             self.watch_weak_clear()       # e.g. a weak barrel pulled, the dock left in
-            self.apply(why if work else "power source (charger type)")
+            self.apply(why)
         elif "full" in work:
             self.apply(why)
         else:
@@ -1147,15 +1151,18 @@ class Bridge:
     def watch_weak_clear(self):
         """A weak barrel unplugged for good ends the weak-barrel state: on a
         UPower edge or a source change with the barrel gone (on battery, or
-        only USB-C left), a 10 s countdown starts, each one starting it again. When it runs out
+        only USB-C left), a 10 s countdown starts; the barrel coming back
+        stops it, and more dropouts while it's gone don't start it again. When it runs out
         the next definite firmware read decides: no barrel, cleared; a
         barrel, it stands."""
-        if self.weak_clear_timer:
-            GLib.source_remove(self.weak_clear_timer)
-            self.weak_clear_timer = 0
-        self.weak_expired = False
         if not (self.weak and (self.on_battery or self.kind == "usbc")):
+            if self.weak_clear_timer:
+                GLib.source_remove(self.weak_clear_timer)
+                self.weak_clear_timer = 0
+            self.weak_expired = False
             return
+        if self.weak_clear_timer or self.weak_expired:
+            return                        # still gone: the deadline stands
 
         def expire():
             self.weak_clear_timer = 0
@@ -1366,7 +1373,8 @@ class Bridge:
 
     # ---- charge hold on a weak barrel (#165) ----
     def hold_wanted(self):
-        return self.weak and bool(self.charge) and self.conf.get("CHARGE_HOLD_WEAK_BARREL", "") == "1"
+        return (self.weak and self.kind != "usbc" and bool(self.charge)
+                and self.conf.get("CHARGE_HOLD_WEAK_BARREL", "") == "1")
 
     def battery_percent(self):
         if not self.battery:

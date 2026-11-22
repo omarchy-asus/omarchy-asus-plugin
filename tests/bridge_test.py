@@ -530,11 +530,19 @@ class BridgeTest(unittest.TestCase):
     def test_charger_classified_late_is_read_again(self):
         h = self.harness(charge_mode=1, on_battery=True)
         h.wait(lambda: h.state.get("source") == "battery" and h.state.get("refreshHz") == 60, what="battery")
+        evals = len(h.hypr.evals)
         h.set_charge_mode(0)              # the firmware hasn't looked at the new adapter yet
         h.power(False)
-        h.wait(lambda: h.state.get("source") == "ac", what="first guess")
+        time.sleep(2.2)                   # the settle (1.5 s) read 0 and waits
+        self.assertEqual(h.state.get("source"), "battery", "no guess while the firmware looks")
         h.set_charge_mode(2)              # it turns out to be USB-C
-        h.wait(lambda: h.state.get("source") == "usbc" and h.hypr.hz == 60, timeout=4, what="USB-C after the re-read")
+        h.wait(lambda: h.state.get("source") == "usbc", timeout=4, what="USB-C after the re-read")
+        self.assertEqual(len(h.hypr.evals), evals, "60 Hz all along: never a guessed 240")
+        h.power(True)                     # and a firmware that never says: AC, after 2 s
+        h.wait(lambda: h.state.get("source") == "battery", what="battery")
+        h.set_charge_mode(0)
+        h.power(False)
+        h.wait(lambda: h.state.get("source") == "ac", timeout=6, what="AC when it never says")
 
     def test_a_second_charger_is_noticed_on_the_next_apply(self):
         # Docked on USB-C, then the barrel goes in: UPower still says AC,
@@ -565,18 +573,22 @@ class BridgeTest(unittest.TestCase):
         sets = len(h.ppt_sets())
         h.set_charge_mode(0)              # the firmware is looking at a charger
         h.hypr.event("configreloaded>>")
-        h.wait(lambda: "apply (hyprland configreloaded): usbc" in h.stderr(), what="the read of 0")
+        time.sleep(1.8)                   # the settle (1.5 s) read 0 and waits
+        self.assertNotIn("apply (hyprland configreloaded)", h.stderr(), "the work waits for a definite read")
         self.assertEqual((h.state.get("source"), h.hypr.hz), ("usbc", 60), "no guess while it looks")
         h.set_charge_mode(1)              # the barrel, found while the retry runs
         h.wait(lambda: h.state.get("source") == "ac" and h.hypr.hz == 240, timeout=4, what="barrel after the re-read")
         self.assertEqual(len(h.ppt_sets()), sets, "the barrel needs no limits written")
 
     def test_a_profile_change_while_a_charger_settles_waits_for_it(self):
-        h = self.harness(charge_mode=1)
+        h = self.harness(conf=CONF + 'PPT_AC="45 55 65"\nPPT_USBC="25 30 40"\n', charge_mode=1)
         h.wait(lambda: h.state.get("source") == "ac" and h.hypr.hz == 240, what="barrel")
+        h.wait(lambda: len(h.ppt_sets()) == 3, what="barrel limits")
         evals = len(h.hypr.evals)
         h.power(True)                     # a brief dropout, with Omarchy's profile switches
         h.fake({"set": ["/xyz/ljones", "xyz.ljones.Platform", "PlatformProfile", "u", 1]})
+        time.sleep(0.5)
+        self.assertEqual(h.curve_calls(), [[0, "CPU", True]], "nothing for profile 1 before the settle")
         h.power(False)
         h.fake({"set": ["/xyz/ljones", "xyz.ljones.Platform", "PlatformProfile", "u", 0]})
         time.sleep(2.5)
@@ -591,12 +603,21 @@ class BridgeTest(unittest.TestCase):
         h.set_charge_mode(2)              # the barrel pulled; the dock still charges
         h.hypr.event("configreloaded>>")
         h.wait(lambda: h.state.get("source") == "usbc", what="USB-C")
-        h.wait(lambda: h.state.get("chargeHeld") == 0, timeout=15, what="hold released")
-        self.assertIn("weak barrel cleared", h.stderr())
+        h.wait(lambda: h.state.get("chargeHeld") == 0, what="no hold on USB-C")
+        h.wait(lambda: "weak barrel cleared" in h.stderr(), timeout=15, what="weak cleared after 10 s")
         self.assertEqual(h.charge_sets(), [50, 80])
         h.set_charge_mode(1)              # a barrel again: not weak until it flaps
         h.hypr.event("configreloaded>>")
         h.wait(lambda: h.state.get("source") == "ac", what="a fresh barrel")
+
+    def test_a_docks_dropouts_never_make_a_weak_barrel(self):
+        h = self.harness(conf=HOLD, charge_mode=2)
+        h.wait(lambda: h.state.get("source") == "usbc" and h.state.get("hasAura"), what="docked on USB-C")
+        h.flap()
+        time.sleep(2)
+        self.assertEqual((h.state.get("source"), h.state.get("chargeHeld")), ("usbc", 0))
+        self.assertNotIn("weak barrel", h.stderr())
+        self.assertEqual(h.charge_sets(), [])
 
     def test_backlight_dims_leaving_the_barrel_and_comes_back(self):
         h = self.harness(conf=CONF + "BRIGHT_BATTERY=30\n", charge_mode=1, bright=80)
