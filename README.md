@@ -79,10 +79,10 @@ a script):
 
 "AC" means the barrel charger. A USB-C charger gets the battery settings:
 UPower calls both chargers AC, so the widget tells them apart by asus-armoury's
-`charge_mode` (bit 0 barrel, bit 1 USB-C). It asks the firmware every time it
-applies settings and on every charger plug event, so plugging or pulling one
-charger while the other stays in is noticed too (UPower reports no change
-then). A barrel that drops out three or
+`charge_mode` (bit 0 barrel, bit 1 USB-C). It asks the firmware again after
+every charger event, screen change (so every resume) and power-profile change,
+so plugging or pulling one charger while the other stays in is noticed too
+(UPower reports no change then). A barrel that drops out three or
 more times in 30 s (a third-party adapter that can't carry the load) is a
 **weak barrel**: it keeps the AC settings and gets `PPT_WEAK_BARREL` until it's
 unplugged for good. Power-source changes apply once the source has been stable

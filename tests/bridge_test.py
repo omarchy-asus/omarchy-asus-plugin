@@ -545,6 +545,11 @@ class BridgeTest(unittest.TestCase):
         h.hypr.event("configreloaded>>")
         h.wait(lambda: h.state.get("source") == "ac" and h.hypr.hz == 240, what="barrel after a reload")
         self.assertIn("charger: usbc -> ac", h.stderr())
+        # Both bits: the barrel and the dock, still the barrel's settings.
+        h.set_charge_mode(3)
+        h.hypr.event("configreloaded>>")
+        time.sleep(2)
+        self.assertEqual((h.state.get("source"), h.hypr.hz), ("ac", 240))
         # And back: the barrel pulled, the dock still charging.
         h.set_charge_mode(2)
         h.fake({"set": ["/xyz/ljones", "xyz.ljones.Platform", "PlatformProfile", "u", 3]})
