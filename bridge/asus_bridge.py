@@ -736,6 +736,7 @@ class Bridge:
         self.kind_tries = 0
         self.kind_timer = 0
         self.udev = None          # GUdev client for the chargers' kernel events
+        self.supply_timer = 0
         self.edges = []           # monotonic times of charger online/offline edges
         self.weak = False
         self.debounce_timer = 0
@@ -996,8 +997,10 @@ class Bridge:
                 self.end_hold()
         if iface == PLATFORM and "PlatformProfile" in changed:
             # Omarchy switches the profile on a charger change: ask the
-            # firmware again, and the curve gate belongs to the new profile.
-            if self.read_charger():
+            # firmware again (unless a power edge is still settling: that
+            # applies everything when it does), and the curve gate belongs to
+            # the new profile.
+            if self.read_charger("profile change"):
                 self.apply("profile change")
             elif self.limits_on:
                 self.apply_limits("profile change")
@@ -1022,25 +1025,62 @@ class Bridge:
         USB-C and battery."""
         return "AC" if self.kind in ("ac", "weak") else "BATTERY"
 
-    def read_charger(self):
+    def read_charger(self, why):
         """Ask the firmware which charger is in, every time, rather than
         trusting the last answer: with one charger already in, plugging or
         pulling the other one changes nothing UPower reports. True when
-        the source changed."""
-        kind, _ = self.read_kind()
+        the source changed. While a power edge is settling, the settle
+        decides. While the firmware is still classifying a charger
+        (charge_mode 0), the last source stands (off battery: AC) and the
+        firmware is asked again every 250 ms, at most 8 times."""
+        if self.debounce_timer:
+            return False
+        kind, sure = self.read_kind()
+        if sure:
+            if self.kind_timer:
+                GLib.source_remove(self.kind_timer)
+                self.kind_timer = 0
+            return self.set_kind(kind)
+        if not self.kind_timer:
+            self.kind_tries = 0
+
+            def again():
+                self.kind_tries += 1
+                k, ok = self.read_kind()
+                if not ok and self.kind_tries < 8:
+                    return True
+                self.kind_timer = 0
+                if ok and self.set_kind(k):
+                    self.apply(why + " (charger type)")
+                    self.emit()
+                return False
+            self.kind_timer = GLib.timeout_add(250, again)
+        return self.set_kind(kind if self.kind == "battery" else self.kind)
+
+    def set_kind(self, kind):
         if kind == self.kind:
             return False
         log(f"charger: {self.kind} -> {kind}")
         self.kind = kind
+        self.watch_weak_clear()
         return True
 
     def supply_event(self, _client, _action, dev):
-        """A kernel event on a charger: the barrel or a USB-C port. These
-        fire only on plug events (the battery's own are skipped), and catch
-        a second charger going in or out, which UPower doesn't report."""
-        if dev.get_sysfs_attr("type") == "Battery":
+        """A kernel event on a charger: the barrel or a USB-C port; the
+        battery's own are skipped. It catches a second charger going in or
+        out, which UPower doesn't report. Settings are applied only if the
+        source changed (a USB-C port also reports power changes while
+        plugged), and a burst is read once, 1.5 s after its first event."""
+        if dev.get_sysfs_attr("type") == "Battery" or self.supply_timer:
             return
-        self.power_edge(count=False)
+
+        def go():
+            self.supply_timer = 0
+            if self.read_charger("charger event"):
+                self.apply("charger event")
+                self.emit()
+            return False
+        self.supply_timer = GLib.timeout_add(DEBOUNCE_MS, go)
 
     def read_kind(self):
         if self.on_battery:
@@ -1086,20 +1126,7 @@ class Bridge:
         if not self.on_battery and len(self.edges) >= WEAK_EDGES and not self.weak:
             self.weak = True
             log(f"weak barrel: {len(self.edges)} charger edges in {WEAK_WINDOW:.0f} s")
-        if self.weak_clear_timer:
-            GLib.source_remove(self.weak_clear_timer)
-            self.weak_clear_timer = 0
-        if self.on_battery and self.weak:
-            # Unplugged for good (10 s on battery) ends the weak-barrel state.
-            def clear():
-                self.weak_clear_timer = 0
-                if self.on_battery:
-                    self.weak = False
-                    self.edges = []
-                    log("weak barrel cleared")
-                    self.release_hold("unplugged")
-                return False
-            self.weak_clear_timer = GLib.timeout_add_seconds(WEAK_CLEAR_S, clear)
+        self.watch_weak_clear()
         if self.debounce_timer:
             GLib.source_remove(self.debounce_timer)
 
@@ -1109,30 +1136,33 @@ class Bridge:
             return False
         self.debounce_timer = GLib.timeout_add(DEBOUNCE_MS, settled)
 
+    def barrel_gone(self):
+        return self.on_battery or self.kind == "usbc"
+
+    def watch_weak_clear(self):
+        """A weak barrel unplugged for good (10 s without it: on battery, or
+        with only a USB-C charger left) ends the weak-barrel state. Each
+        charger edge starts the 10 s again."""
+        if self.weak_clear_timer:
+            GLib.source_remove(self.weak_clear_timer)
+            self.weak_clear_timer = 0
+        if not (self.weak and self.barrel_gone()):
+            return
+
+        def clear():
+            self.weak_clear_timer = 0
+            if self.weak and self.barrel_gone():
+                self.weak = False
+                self.edges = []
+                log("weak barrel cleared")
+                self.release_hold("unplugged")
+            return False
+        self.weak_clear_timer = GLib.timeout_add_seconds(WEAK_CLEAR_S, clear)
+
     def update_kind(self, why):
-        """Work out the source and apply. The firmware sets charge_mode a
-        moment after an adapter comes online, so a 0 is read again every
-        250 ms, at most 8 times, after a power event (never while idle)."""
-        if self.kind_timer:
-            GLib.source_remove(self.kind_timer)
-            self.kind_timer = 0
-        _, sure = self.read_kind()
+        """Work out the source and apply (apply asks the firmware)."""
         self.apply(why)
         self.emit()
-        if not sure:
-            self.kind_tries = 0
-
-            def again():
-                self.kind_tries += 1
-                _, ok = self.read_kind()
-                if ok or self.kind_tries >= 8:
-                    self.kind_timer = 0
-                    if self.read_charger():
-                        self.apply(why + " (charger type)")
-                        self.emit()
-                    return False
-                return True
-            self.kind_timer = GLib.timeout_add(250, again)
 
     def target_hz(self):
         pin = pinned_hz()
@@ -1148,7 +1178,7 @@ class Bridge:
         uses the AC keyboard and overdrive. The firmware is asked which
         charger is in first; a changed source gets everything, not just the
         refresh rate."""
-        if self.read_charger():
+        if self.read_charger(why):
             refresh_only = False
         src = "AC" if gaming_on() and not pinned_hz() else self.source()
         log(f"apply ({why}): {self.kind}")
