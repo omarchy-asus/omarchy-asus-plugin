@@ -539,21 +539,25 @@ class BridgeTest(unittest.TestCase):
     def test_a_second_charger_is_noticed_on_the_next_apply(self):
         # Docked on USB-C, then the barrel goes in: UPower still says AC,
         # nothing changes there, only the firmware's charge_mode does.
-        h = self.harness(conf=CONF + 'PPT_USBC="25 30 40"\n', charge_mode=2)
+        h = self.harness(conf=CONF + 'PPT_USBC="25 30 40"\nPPT_AC="45 55 65"\n', charge_mode=2)
         h.wait(lambda: h.state.get("source") == "usbc" and h.hypr.hz == 60, what="docked on USB-C")
         h.set_charge_mode(1)
         h.hypr.event("configreloaded>>")
         h.wait(lambda: h.state.get("source") == "ac" and h.hypr.hz == 240, what="barrel after a reload")
         self.assertIn("charger: usbc -> ac", h.stderr())
-        # Both bits: the barrel and the dock, still the barrel's settings.
-        h.set_charge_mode(3)
-        h.hypr.event("configreloaded>>")
-        time.sleep(2)
-        self.assertEqual((h.state.get("source"), h.hypr.hz), ("ac", 240))
-        # And back: the barrel pulled, the dock still charging.
+        # The barrel pulled, the dock still charging: a profile change gets
+        # the new profile USB-C's limits, never the barrel's.
+        n = len(h.ppt_sets())
         h.set_charge_mode(2)
         h.fake({"set": ["/xyz/ljones", "xyz.ljones.Platform", "PlatformProfile", "u", 3]})
         h.wait(lambda: h.state.get("source") == "usbc" and h.hypr.hz == 60, what="USB-C after a profile change")
+        h.wait(lambda: len(h.ppt_sets()) == n + 3, what="USB-C limits")
+        self.assertEqual(h.ppt_sets()[n:], [("ppt_pl1_spl", 25), ("ppt_pl2_sppt", 30), ("ppt_pl3_fppt", 40)])
+        self.assertEqual(h.curve_calls()[-1:], [[3, "CPU", True]], "the curve gate on the new profile")
+        # Both bits, straight from USB-C: the barrel and the dock get the barrel's settings.
+        h.set_charge_mode(3)
+        h.hypr.event("configreloaded>>")
+        h.wait(lambda: h.state.get("source") == "ac" and h.hypr.hz == 240, what="both chargers")
 
     def test_a_charger_being_classified_keeps_the_last_source(self):
         h = self.harness(conf=CONF + 'PPT_USBC="25 30 40"\n', charge_mode=2)
@@ -561,7 +565,7 @@ class BridgeTest(unittest.TestCase):
         sets = len(h.ppt_sets())
         h.set_charge_mode(0)              # the firmware is looking at a charger
         h.hypr.event("configreloaded>>")
-        time.sleep(1.5)
+        h.wait(lambda: "apply (hyprland configreloaded): usbc" in h.stderr(), what="the read of 0")
         self.assertEqual((h.state.get("source"), h.hypr.hz), ("usbc", 60), "no guess while it looks")
         h.set_charge_mode(1)              # the barrel, found while the retry runs
         h.wait(lambda: h.state.get("source") == "ac" and h.hypr.hz == 240, timeout=4, what="barrel after the re-read")
