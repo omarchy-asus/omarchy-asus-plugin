@@ -79,7 +79,10 @@ a script):
 
 "AC" means the barrel charger. A USB-C charger gets the battery settings:
 UPower calls both chargers AC, so the widget tells them apart by asus-armoury's
-`charge_mode` (bit 0 barrel, bit 1 USB-C). A barrel that drops out three or
+`charge_mode` (bit 0 barrel, bit 1 USB-C). It asks the firmware every time it
+applies settings and on every charger plug event, so plugging or pulling one
+charger while the other stays in is noticed too (UPower reports no change
+then). A barrel that drops out three or
 more times in 30 s (a third-party adapter that can't carry the load) is a
 **weak barrel**: it keeps the AC settings and gets `PPT_WEAK_BARREL` until it's
 unplugged for good. Power-source changes apply once the source has been stable
@@ -155,10 +158,13 @@ switch stay.
 
 `Service.qml` (manifest kind `service`) holds the widget's state once, however
 many bars show it. Everything that touches the machine is one process,
-`bridge/asus_bridge.py`. It uses only the Python standard library and
-PyGObject's Gio, both on stock Omarchy, and it spawns nothing. It talks to:
+`bridge/asus_bridge.py`. It uses only the Python standard library,
+PyGObject's Gio and libgudev (UPower's own dependency), all on stock Omarchy,
+and it spawns nothing. It talks to:
 - asusd and UPower over D-Bus, and follows their `PropertiesChanged` signals;
 - Hyprland over its IPC sockets, including the event socket;
+- the kernel's charger events (`power_supply`, the battery's own skipped),
+  through libgudev; without it the charger type is still read on every apply;
 - the keyboard LED's `brightness_hw_changed` (Fn+F2/F3) and the settings
   files, through inotify.
 

@@ -536,6 +536,20 @@ class BridgeTest(unittest.TestCase):
         h.set_charge_mode(2)              # it turns out to be USB-C
         h.wait(lambda: h.state.get("source") == "usbc" and h.hypr.hz == 60, timeout=4, what="USB-C after the re-read")
 
+    def test_a_second_charger_is_noticed_on_the_next_apply(self):
+        # Docked on USB-C, then the barrel goes in: UPower still says AC,
+        # nothing changes there, only the firmware's charge_mode does.
+        h = self.harness(conf=CONF + 'PPT_USBC="25 30 40"\n', charge_mode=2)
+        h.wait(lambda: h.state.get("source") == "usbc" and h.hypr.hz == 60, what="docked on USB-C")
+        h.set_charge_mode(1)
+        h.hypr.event("configreloaded>>")
+        h.wait(lambda: h.state.get("source") == "ac" and h.hypr.hz == 240, what="barrel after a reload")
+        self.assertIn("charger: usbc -> ac", h.stderr())
+        # And back: the barrel pulled, the dock still charging.
+        h.set_charge_mode(2)
+        h.fake({"set": ["/xyz/ljones", "xyz.ljones.Platform", "PlatformProfile", "u", 3]})
+        h.wait(lambda: h.state.get("source") == "usbc" and h.hypr.hz == 60, what="USB-C after a profile change")
+
     def test_backlight_dims_leaving_the_barrel_and_comes_back(self):
         h = self.harness(conf=CONF + "BRIGHT_BATTERY=30\n", charge_mode=1, bright=80)
         h.wait(lambda: h.state.get("refreshHz") == 240, what="started on the barrel")

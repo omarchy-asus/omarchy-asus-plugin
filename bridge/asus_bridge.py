@@ -113,6 +113,14 @@ gi.require_version("Gio", "2.0")
 gi.require_version("GLib", "2.0")
 from gi.repository import Gio, GLib  # noqa: E402
 
+try:
+    # libgudev (an UPower dependency): the kernel's charger events. Without
+    # it the charger type is still read on every apply.
+    gi.require_version("GUdev", "1.0")
+    from gi.repository import GUdev  # noqa: E402
+except (ImportError, ValueError):
+    GUdev = None
+
 ASUSD = "xyz.ljones.Asusd"
 AURA = "xyz.ljones.Aura"
 SLASH = "xyz.ljones.Slash"
@@ -727,6 +735,7 @@ class Bridge:
         self.kind = "ac"          # ac (barrel) | usbc | battery
         self.kind_tries = 0
         self.kind_timer = 0
+        self.udev = None          # GUdev client for the chargers' kernel events
         self.edges = []           # monotonic times of charger online/offline edges
         self.weak = False
         self.debounce_timer = 0
@@ -985,10 +994,13 @@ class Bridge:
                 log(f"charge limit set to {v}% elsewhere; charge hold ended")
                 state_remove(HOLD_NAME)
                 self.end_hold()
-        if iface == PLATFORM and "PlatformProfile" in changed and self.limits_on:
-            # Omarchy switches the profile on a charger change: the curve
-            # gate belongs to the new profile now.
-            self.apply_limits("profile change")
+        if iface == PLATFORM and "PlatformProfile" in changed:
+            # Omarchy switches the profile on a charger change: ask the
+            # firmware again, and the curve gate belongs to the new profile.
+            if self.read_charger():
+                self.apply("profile change")
+            elif self.limits_on:
+                self.apply_limits("profile change")
         if key in self.cache:
             self.cache[key].update(changed)
             if invalidated:
@@ -1009,6 +1021,26 @@ class Bridge:
         """Which settings apply: AC on the barrel (weak or not), BATTERY on
         USB-C and battery."""
         return "AC" if self.kind in ("ac", "weak") else "BATTERY"
+
+    def read_charger(self):
+        """Ask the firmware which charger is in, every time, rather than
+        trusting the last answer: with one charger already in, plugging or
+        pulling the other one changes nothing UPower reports. True when
+        the source changed."""
+        kind, _ = self.read_kind()
+        if kind == self.kind:
+            return False
+        log(f"charger: {self.kind} -> {kind}")
+        self.kind = kind
+        return True
+
+    def supply_event(self, _client, _action, dev):
+        """A kernel event on a charger: the barrel or a USB-C port. These
+        fire only on plug events (the battery's own are skipped), and catch
+        a second charger going in or out, which UPower doesn't report."""
+        if dev.get_sysfs_attr("type") == "Battery":
+            return
+        self.power_edge(count=False)
 
     def read_kind(self):
         if self.on_battery:
@@ -1084,8 +1116,7 @@ class Bridge:
         if self.kind_timer:
             GLib.source_remove(self.kind_timer)
             self.kind_timer = 0
-        kind, sure = self.read_kind()
-        self.kind = kind
+        _, sure = self.read_kind()
         self.apply(why)
         self.emit()
         if not sure:
@@ -1093,11 +1124,10 @@ class Bridge:
 
             def again():
                 self.kind_tries += 1
-                k, ok = self.read_kind()
+                _, ok = self.read_kind()
                 if ok or self.kind_tries >= 8:
                     self.kind_timer = 0
-                    if k != self.kind:
-                        self.kind = k
+                    if self.read_charger():
                         self.apply(why + " (charger type)")
                         self.emit()
                     return False
@@ -1115,7 +1145,11 @@ class Bridge:
     def apply(self, why, refresh_only=False):
         """Apply the settings for the current power source. Keys that are not
         set are left alone, except the keyboard on battery (off). Gaming mode
-        uses the AC keyboard and overdrive."""
+        uses the AC keyboard and overdrive. The firmware is asked which
+        charger is in first; a changed source gets everything, not just the
+        refresh rate."""
+        if self.read_charger():
+            refresh_only = False
         src = "AC" if gaming_on() and not pinned_hz() else self.source()
         log(f"apply ({why}): {self.kind}")
         self.apply_refresh()
@@ -1842,6 +1876,9 @@ class Bridge:
             self.system.signal_subscribe(UPOWER, PROPS, "PropertiesChanged", path, None,
                                          Gio.DBusSignalFlags.NONE, self.props_changed)
         self.read_on_battery()
+        if GUdev:
+            self.udev = GUdev.Client.new(["power_supply"])
+            self.udev.connect("uevent", self.supply_event)
         Gio.bus_watch_name_on_connection(self.system, ASUSD, Gio.BusNameWatcherFlags.NONE,
                                          self.asusd_appeared, self.asusd_vanished)
         self.watch_files()
